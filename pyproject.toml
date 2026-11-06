@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pdf-cad-engine"
+version = "1.0.0"
+description = "PDF <-> DXF conversion engine (command-line tool) used by PDFConvert"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "Quazar Digital OÜ" }]
+# Exact pins: the service pins the engine version, the engine pins its libraries.
+# Keep in sync with requirements.txt.
+dependencies = [
+    "ezdxf==1.4.5",
+    "pymupdf==1.26.7",
+    "Pillow==12.3.0",
+    "numpy==2.5.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.2.0",
+    "ruff==0.17.4",
+]
+
+[project.scripts]
+cad-engine = "cad_engine.cli:main"
+
+[tool.setuptools]
+packages = ["cad_engine"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cad_engine"]
+known-local-folder = ["conftest", "make_sample"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = [
+    # PyMuPDF's SWIG bindings on Python 3.12+
+    "ignore:builtin type .* has no __module__ attribute:DeprecationWarning",
+]

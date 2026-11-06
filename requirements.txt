@@ -1,0 +1,10 @@
+# Runtime pins for the server installer: pip install -r requirements.txt
+# Direct dependencies — keep in sync with [project.dependencies] in pyproject.toml.
+ezdxf==1.4.5
+pymupdf==1.26.7
+Pillow==12.3.0
+numpy==2.5.4
+# Transitive dependencies of ezdxf, pinned for reproducible installs.
+fonttools==4.68.0
+pyparsing==3.3.3
+typing_extensions==4.16.0
