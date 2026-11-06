@@ -4,8 +4,10 @@
 
 `build_sample_plan` is the realistic architectural DXF from the prototype
 (polylines, lines, arc, circle, ellipse, spline, TEXT/MTEXT, linear dimensions,
-ANSI31 hatch, block inserts, 7 layers, DASHED linetype). The PDF builders create
-small vector / scan-like / multi-page / layered PDFs with PyMuPDF.
+ANSI31 hatch, block inserts, 7 layers, DASHED linetype); `build_layouts_dxf` adds two
+paper-space layouts with viewports. The PDF builders create small vector / scan-like /
+multi-page / layered PDFs with PyMuPDF, plus the phase-2 inputs (circles and arcs,
+fills, dashed runs, duplicates, scale, scanned drawing, mixed vector + scan).
 
 Run directly to write the sample plan: ``python tests/make_sample.py out.dxf``.
 """
@@ -83,6 +85,26 @@ def build_sample_plan(out: Path, *, fmt: str = "asc") -> Path:
         msp.add_blockref("CHAIR", (6000 + i * 600, 800), dxfattribs={"layer": "FURNITURE"})
 
     doc.saveas(out, fmt=fmt)
+    return out
+
+
+def build_layouts_dxf(out: Path) -> Path:
+    """The sample plan plus paper-space layouts "Plan A3" (A3 landscape, one viewport on the
+    whole plan) and "Detail" (A4 landscape, a viewport on the door and a TEXT title);
+    the default "Layout1" stays empty."""
+    import ezdxf
+
+    plan = build_sample_plan(out.with_suffix(".plan.dxf"))
+    doc = ezdxf.readfile(plan)
+    sheet = doc.layouts.new("Plan A3")
+    sheet.page_setup(size=(420, 297), margins=(10, 10, 10, 10), units="mm")
+    sheet.add_viewport(center=(210, 148.5), size=(380, 250), view_center_point=(5000, 3000), view_height=7000)
+    detail = doc.layouts.new("Detail")
+    detail.page_setup(size=(297, 210), margins=(10, 10, 10, 10), units="mm")
+    detail.add_viewport(center=(148.5, 105), size=(250, 170), view_center_point=(5000, 2500),
+                        view_height=2500)
+    detail.add_text("DETAIL", height=5).set_placement((20, 20))
+    doc.saveas(out)
     return out
 
 
@@ -269,6 +291,172 @@ def build_scan_pdf(out: Path) -> Path:
     doc = pymupdf.open()
     page = doc.new_page(width=A4_W, height=A4_H)
     page.insert_image(page.rect, stream=_noise_png())
+    doc.save(out)
+    return out
+
+
+def build_scan_drawing_pdf(out: Path, dpi: int = 100) -> Path:
+    """A scanned drawing: a frame, a circle and a diagonal drawn in black 2 pt lines,
+    rasterised in grey at `dpi` and placed as the only content of an A4 landscape page."""
+    import pymupdf
+
+    src = pymupdf.open()
+    page = src.new_page(width=A4_H, height=A4_W)
+    page.draw_rect(pymupdf.Rect(60, 60, 780, 530), color=(0, 0, 0), width=2)
+    page.draw_circle((250, 250), 60, color=(0, 0, 0), width=2)
+    page.draw_line((400, 450), (700, 150), color=(0, 0, 0), width=2)
+    pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY)
+    doc = pymupdf.open()
+    scan = doc.new_page(width=A4_H, height=A4_W)
+    scan.insert_image(scan.rect, stream=pix.tobytes("png"))
+    doc.save(out)
+    return out
+
+
+def build_mixed_pdf(out: Path) -> Path:
+    """Page 1: vector lines and text; page 2: a scanned drawing (image only)."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4_H, height=A4_W)
+    page.draw_rect(pymupdf.Rect(60, 60, 780, 530), color=(0, 0, 1), width=1)
+    page.insert_text((100, 100), "VECTOR PAGE", fontsize=12)
+    doc.insert_pdf(pymupdf.open(build_scan_drawing_pdf(out.with_suffix(".scan.pdf"))))
+    doc.save(out)
+    return out
+
+
+def _arc_bezier(cx: float, cy: float, r: float, a0: float, a1: float):
+    """Control points (page coordinates, y down) of a cubic Bézier for the arc a0 -> a1 (deg)."""
+    import math
+
+    a, b = math.radians(a0), math.radians(a1)
+    k = 4.0 / 3.0 * math.tan((b - a) / 4.0)
+    p0 = (cx + r * math.cos(a), cy - r * math.sin(a))
+    p3 = (cx + r * math.cos(b), cy - r * math.sin(b))
+    p1 = (p0[0] - k * r * math.sin(a), p0[1] - k * r * math.cos(a))
+    p2 = (p3[0] + k * r * math.sin(b), p3[1] + k * r * math.cos(b))
+    return p0, p1, p2, p3
+
+
+def build_circles_pdf(out: Path) -> Path:
+    """Spec scenarios for --arcs on an A4 landscape page:
+    a circle r = 50 pt as 4 Béziers (red), a 90° arc as 1 Bézier (blue, counter-clockwise from
+    0° to 90° in DXF terms), a 180° arc as 2 Béziers (green), a 2:1 ellipse as 4 Béziers (black),
+    and an S-curve of 2 Béziers that is no arc (magenta)."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4_H, height=A4_W)
+    shape = page.new_shape()
+    shape.draw_circle((150, 150), 50)
+    shape.finish(color=(1, 0, 0), width=0.5, closePath=False)
+    shape.draw_bezier(*_arc_bezier(350, 200, 60, 0, 90))
+    shape.finish(color=(0, 0, 1), width=0.5, closePath=False)
+    first = _arc_bezier(550, 200, 40, 0, 90)
+    second = _arc_bezier(550, 200, 40, 90, 180)
+    shape.draw_bezier(*first)
+    shape.draw_bezier(*second)
+    shape.finish(color=(0, 0.6, 0), width=0.5, closePath=False)
+    shape.draw_oval(pymupdf.Rect(100, 350, 300, 450))
+    shape.finish(color=(0, 0, 0), width=0.5, closePath=False)
+    shape.draw_bezier((400, 400), (450, 350), (500, 350), (550, 400))
+    shape.draw_bezier((550, 400), (600, 450), (650, 450), (700, 400))
+    shape.finish(color=(1, 0, 1), width=0.5, closePath=False)
+    shape.commit()
+    doc.save(out)
+    return out
+
+
+def build_fills_pdf(out: Path) -> Path:
+    """--hatch-fills: a red fill-only path with a rectangle and a circle (2 loops), a blue
+    even-odd square with a square hole, and a green fill + black stroke rectangle."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4_H, height=A4_W)
+    shape = page.new_shape()
+    shape.draw_rect(pymupdf.Rect(50, 50, 150, 120))
+    shape.draw_circle((250, 85), 35)
+    shape.finish(fill=(1, 0, 0), color=None)
+    shape.draw_rect(pymupdf.Rect(50, 200, 250, 400))
+    shape.draw_rect(pymupdf.Rect(100, 250, 200, 350))
+    shape.finish(fill=(0, 0, 1), color=None, even_odd=True)
+    shape.draw_rect(pymupdf.Rect(400, 200, 600, 400))
+    shape.finish(fill=(0, 1, 0), color=(0, 0, 0), width=1)
+    shape.commit()
+    doc.save(out)
+    return out
+
+
+MM = 72.0 / 25.4  # pt per mm
+
+
+def build_dashes_pdf(out: Path) -> Path:
+    """--linetypes on an A4 landscape page (lengths in paper mm):
+    - red: 40 dashes of 3 mm with 2 mm gaps in one path (spec scenario) -> one DASHED LINE;
+    - green: 30 dots of 0.3 mm with 1.2 mm gaps -> one DOT LINE;
+    - blue: a line stroked with the PDF dash array [6 3] -> DASHED polyline;
+    - black: 5 collinear segments with irregular gaps, and 3 regular dashes (too few) -> unchanged."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4_H, height=A4_W)
+    shape = page.new_shape()
+    x0, y = 20 * MM, 30 * MM
+    for i in range(40):
+        x = x0 + i * 5 * MM
+        shape.draw_line((x, y), (x + 3 * MM, y))
+    shape.finish(color=(1, 0, 0), width=0.5, closePath=False)
+    y = 50 * MM
+    for i in range(30):
+        x = x0 + i * 1.5 * MM
+        shape.draw_line((x, y), (x + 0.3 * MM, y))
+    shape.finish(color=(0, 1, 0), width=0.5, closePath=False)
+    shape.commit()
+    page.draw_line((x0, 70 * MM), (x0 + 150 * MM, 70 * MM), color=(0, 0, 1), width=0.5, dashes="[6 3] 0")
+    shape = page.new_shape()
+    xs = [0, 4, 9, 30, 33, 60, 62, 90, 100, 101]
+    for a, b in zip(xs[0::2], xs[1::2], strict=True):
+        shape.draw_line((x0 + a * MM, 90 * MM), (x0 + b * MM, 90 * MM))
+    for i in range(3):
+        shape.draw_line((x0 + i * 5 * MM, 110 * MM), (x0 + (i * 5 + 3) * MM, 110 * MM))
+    shape.finish(color=(0, 0, 0), width=0.5, closePath=False)
+    shape.commit()
+    doc.save(out)
+    return out
+
+
+def build_merge_pdf(out: Path) -> Path:
+    """--merge: the same red line drawn twice, the same line once more in blue (not a
+    duplicate), a black polyline with collinear vertices, and a green S-curve of 3 Béziers."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4_H, height=A4_W)
+    for color in ((1, 0, 0), (1, 0, 0), (0, 0, 1)):
+        page.draw_line((50, 50), (300, 50), color=color, width=0.5)
+    page.draw_polyline([(50, 100), (100, 100), (150, 100), (200, 100), (200, 200), (200, 250)],
+                       color=(0, 0, 0), width=0.5, closePath=False)
+    shape = page.new_shape()
+    shape.draw_bezier((50, 300), (80, 250), (120, 250), (150, 300))
+    shape.draw_bezier((150, 300), (180, 350), (220, 350), (250, 300))
+    shape.draw_bezier((250, 300), (280, 250), (320, 250), (350, 300))
+    shape.finish(color=(0, 0.5, 0), width=0.5, closePath=False)
+    shape.commit()
+    doc.save(out)
+    return out
+
+
+def build_scale_pdf(out: Path) -> Path:
+    """--scale / --units: a black line 100 mm long and a red line 72 pt long, text 10 pt."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    page = doc.new_page(width=A4_W, height=A4_H)
+    page.draw_line((50, 100), (50 + 100 * MM, 100), color=(0, 0, 0), width=0.5)
+    page.draw_line((50, 200), (122, 200), color=(1, 0, 0), width=0.5)
+    page.insert_text((50, 300), "SCALE", fontsize=10)
     doc.save(out)
     return out
 

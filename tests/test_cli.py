@@ -19,7 +19,8 @@ from conftest import ENGINE_DIR, run_engine
 
 META_KEYS = {
     "version", "command", "pages", "entities", "layers", "text_entities", "images", "has_vectors",
-    "text_as_outlines", "traced_pages", "empty", "dxf_version", "page_size_mm", "ms", "code", "message",
+    "text_as_outlines", "traced_pages", "recognized", "scale", "units", "empty", "dxf_version",
+    "page_size_mm", "layouts", "warnings", "ms", "code", "message",
 }
 
 
@@ -27,11 +28,11 @@ def test_version_isolated_mode():
     proc = subprocess.run([sys.executable, "-I", "-m", "cad_engine", "--version"], cwd=ENGINE_DIR,
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0
-    assert proc.stdout == "1.0.0\n"
+    assert proc.stdout == "1.1.0\n"
 
 
 def test_version_matches_package_metadata():
-    assert cad_engine.__version__ == "1.0.0"
+    assert cad_engine.__version__ == "1.1.0"
     assert version("pdf-cad-engine") == cad_engine.__version__
 
 
@@ -41,11 +42,16 @@ def test_stdout_is_exactly_one_json_line(sample_plan_pdf, tmp_path):
     assert run.stdout.count("\n") == 1 and run.stdout.endswith("\n")
     meta = json.loads(run.stdout)
     assert set(meta) == META_KEYS
-    assert meta["version"] == "1.0.0"
+    assert meta["version"] == "1.1.0"
     assert meta["command"] == "pdf2dxf"
     assert meta["code"] is None and meta["message"] is None
     assert isinstance(meta["ms"], int) and meta["ms"] >= 0
     assert meta["traced_pages"] == []
+    # phase-2 keys with every flag off
+    assert meta["recognized"] == {"circles": 0, "arcs": 0, "hatches": 0, "linetypes": 0, "merged": 0}
+    assert meta["warnings"] == []
+    assert (meta["scale"], meta["units"]) == ("asis", "mm")
+    assert meta["layouts"] is None
 
 
 def test_meta_file_matches_stdout(sample_plan_dxf, tmp_path):

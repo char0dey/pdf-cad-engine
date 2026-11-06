@@ -4,6 +4,9 @@
 
     python -I -m cad_engine <command> --in <file> [--out <file>] [--preview <png>]
                             [--meta <path>] [--budget-ms N] [--tmp <dir>]
+                            [pdf2dxf: --arcs --hatch-fills --linetypes --merge --raster-fallback
+                                      --scale asis|1-50|1-100|1-200 --units mm|inch]
+                            [dxf2pdf: --page auto|a4|a3|a2|a1 --colors color|mono --layouts]
     python -I -m cad_engine --version
 
 stdout carries exactly one JSON line (the meta) at the end of every run;
@@ -36,6 +39,8 @@ from cad_engine.errors import (
 
 COMMANDS = ("pdf2dxf", "dxf2pdf", "probe-pdf", "probe-dxf", "preview-dxf")
 NEEDS_OUT = frozenset({"pdf2dxf", "dxf2pdf", "preview-dxf"})
+PDF2DXF_FLAGS = ("arcs", "hatch_fills", "linetypes", "merge", "raster_fallback", "scale", "units")
+DXF2PDF_FLAGS = ("page", "colors", "layouts")
 DEFAULT_BUDGET_MS = 90_000
 DEFAULT_MEMORY_MB = 2048
 MEMORY_ENV = "CAD_ENGINE_MEMORY_MB"  # operational override of the address-space limit
@@ -60,6 +65,25 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--meta", help="also write the JSON meta to this file ('-' = stdout only)")
     parser.add_argument("--budget-ms", type=int, default=DEFAULT_BUDGET_MS, help="time budget in ms")
     parser.add_argument("--tmp", help="directory for temporary files")
+    pdf = parser.add_argument_group("pdf2dxf options (all off by default)")
+    pdf.add_argument("--arcs", action="store_true", default=None,
+                     help="Bézier circles/arcs -> CIRCLE/ARC (0.5 %% of the radius)")
+    pdf.add_argument("--hatch-fills", action="store_true", default=None,
+                     help="fill-only paths -> solid HATCH")
+    pdf.add_argument("--linetypes", action="store_true", default=None,
+                     help="dash runs and PDF dash arrays -> DASHED/DOT linetypes")
+    pdf.add_argument("--merge", action="store_true", default=None,
+                     help="join collinear segments and curve pieces, drop duplicates")
+    pdf.add_argument("--raster-fallback", action="store_true", default=None,
+                     help="trace image-only pages (needs OpenCV, extra [raster])")
+    pdf.add_argument("--scale", choices=("asis", "1-50", "1-100", "1-200"),
+                     help="drawing scale (default asis)")
+    pdf.add_argument("--units", choices=("mm", "inch"), help="DXF units (default mm)")
+    dxf = parser.add_argument_group("dxf2pdf options")
+    dxf.add_argument("--page", choices=("auto", "a4", "a3", "a2", "a1"), help="paper size (default auto)")
+    dxf.add_argument("--colors", choices=("color", "mono"), help="colours (default color)")
+    dxf.add_argument("--layouts", action="store_true", default=None,
+                     help="paper-space layouts as extra pages after Model space")
     return parser
 
 
@@ -75,9 +99,14 @@ def new_meta() -> dict:
         "has_vectors": None,
         "text_as_outlines": None,
         "traced_pages": None,
+        "recognized": None,
+        "scale": None,
+        "units": None,
         "empty": None,
         "dxf_version": None,
         "page_size_mm": None,
+        "layouts": None,
+        "warnings": [],
         "ms": None,
         "code": None,
         "message": None,
@@ -144,6 +173,11 @@ def _check_paths(args: argparse.Namespace) -> None:
         raise UsageError(f"usage error: {args.command} requires --out")
     if args.preview and args.command != "pdf2dxf":
         raise UsageError("usage error: --preview is only supported by pdf2dxf")
+    for command, names in (("pdf2dxf", PDF2DXF_FLAGS), ("dxf2pdf", DXF2PDF_FLAGS)):
+        used = [name for name in names if getattr(args, name) is not None]
+        if used and args.command != command:
+            flags = ", ".join("--" + name.replace("_", "-") for name in used)
+            raise UsageError(f"usage error: {flags} only supported by {command}")
     src = os.path.abspath(args.input)
     for out in (args.out, args.preview):
         if out and os.path.abspath(out) == src:
@@ -159,13 +193,23 @@ def _check_paths(args: argparse.Namespace) -> None:
 
 def _dispatch(args: argparse.Namespace, budget: Budget, meta: dict) -> None:
     if args.command == "pdf2dxf":
-        from cad_engine.pdf2dxf import convert
+        from cad_engine.pdf2dxf import Options, convert
 
-        convert(args.input, args.out, budget=budget, meta=meta, preview_path=args.preview)
+        options = Options(
+            arcs=bool(args.arcs),
+            hatch_fills=bool(args.hatch_fills),
+            linetypes=bool(args.linetypes),
+            merge=bool(args.merge),
+            raster_fallback=bool(args.raster_fallback),
+            scale=args.scale or "asis",
+            units=args.units or "mm",
+        )
+        convert(args.input, args.out, budget=budget, meta=meta, preview_path=args.preview, options=options)
     elif args.command == "dxf2pdf":
         from cad_engine.dxf2pdf import convert as dxf_convert
 
-        dxf_convert(args.input, args.out, budget=budget, meta=meta)
+        dxf_convert(args.input, args.out, budget=budget, meta=meta, page=args.page or "auto",
+                    colors=args.colors or "color", layouts=bool(args.layouts))
     elif args.command == "probe-pdf":
         from cad_engine.probe import probe_pdf
 

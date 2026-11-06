@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdf-cad-engine"
-version = "1.0.0"
+version = "1.1.0"
 description = "PDF <-> DXF conversion engine (command-line tool) used by PDFConvert"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -21,6 +21,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# pdf2dxf --raster-fallback (tracing image-only pages); without it the flag is reported as
+# a warning in the meta. Keep in sync with requirements.txt.
+raster = [
+    "opencv-python-headless==4.14.0.94",
+]
 dev = [
     "pytest==9.2.0",
     "ruff==0.17.4",

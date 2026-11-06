@@ -2,11 +2,18 @@
 # Copyright (C) 2026 Quazar Digital OÜ
 """DXF -> PDF: ezdxf drawing add-on rendered with the PyMuPDF backend.
 
-Model space goes onto one page: A4, or A3 when the drawing is larger than
-20 m or has more than 5 000 entities; orientation follows the extents; the
-content is fitted with 10 mm margins on a white background. Colours are kept
-(ACI 7 and true-colour white become black), lineweights are relative to the
-drawing size, invisible layers and entities are skipped by the ezdxf frontend.
+Model space goes onto the first page: by default (``--page auto``) A4, or A3 when the
+drawing is larger than 20 m or has more than 5 000 entities; ``--page a4|a3|a2|a1`` fixes
+the paper size. The orientation follows the extents; the content is fitted with 10 mm
+margins on a white background. Colours are kept (ACI 7 and true-colour white become
+black) or, with ``--colors mono``, everything is black; lineweights are relative to the
+drawing size; invisible layers and entities are skipped by the ezdxf frontend.
+
+``--layouts`` adds one page per paper-space layout that has content (entities or
+viewports that show model space), in tab order after Model space, each in its own paper
+size (A4 landscape when the layout has none); viewports show model space through their
+clipping window. A layout whose viewports show an empty part of model space comes out as a
+blank sheet (as a CAD program would plot it).
 """
 
 from __future__ import annotations
@@ -22,12 +29,17 @@ from cad_engine.errors import EngineError, InputError
 if TYPE_CHECKING:
     from ezdxf.addons.drawing.pymupdf import PyMuPdfBackend
     from ezdxf.document import Drawing
+    from ezdxf.layouts import Layout
 
 A4_MM = (297.0, 210.0)
 A3_MM = (420.0, 297.0)
+PAGE_SIZES_MM = {"a4": A4_MM, "a3": A3_MM, "a2": (594.0, 420.0), "a1": (841.0, 594.0)}
+PAGE_CHOICES = ("auto", *PAGE_SIZES_MM)
+COLOR_CHOICES = ("color", "mono")
 LARGE_EXTENT_MM = 20_000.0
 LARGE_ENTITY_COUNT = 5_000
 MARGIN_MM = 10.0
+LAYOUT_FIT_MIN_RATIO = 0.25  # paper-space content smaller than this share of the page is scaled up
 
 
 def _white_to_black(entity, properties) -> None:  # ezdxf override signature
@@ -52,19 +64,53 @@ def check_not_empty(doc: Drawing) -> tuple[float, float]:
     return w, h
 
 
-def render_modelspace(doc: Drawing, budget: Budget) -> PyMuPdfBackend:
-    """Record model space with the ezdxf frontend (budget checked every 200 entities)."""
-    from ezdxf.addons.drawing import Frontend, RenderContext, config
+def drawn_viewports(layout: Layout) -> list:
+    """The viewports the ezdxf frontend draws (same rules as ``frontend._draw_viewports``):
+    status > 0, minus the "active" viewport (status 1, the sheet itself), top views only."""
+    viewports = sorted((e for e in layout if e.dxftype() == "VIEWPORT"), key=lambda e: e.dxf.status)
+    viewports = [vp for vp in viewports if vp.dxf.status > 0]
+    if viewports and viewports[0].dxf.get("status", 1) == 1:
+        viewports.pop(0)
+    return [vp for vp in viewports if vp.is_top_view]
+
+
+def layout_content(layout: Layout) -> list:
+    """Paper-space entities that draw something: everything but viewports, plus the
+    viewports that show model space."""
+    return [e for e in layout if e.dxftype() != "VIEWPORT"] + drawn_viewports(layout)
+
+
+def paper_layouts(doc: Drawing) -> list[str]:
+    """Names of the paper-space layouts (tab order) with content: paper-space entities or
+    viewports that show model space (see `drawn_viewports`)."""
+    names = []
+    for name in doc.layouts.names_in_taborder():
+        if name.lower() == "model":
+            continue
+        layout = doc.layouts.get(name)
+        if layout is not None and layout_content(layout):
+            names.append(name)
+    return names
+
+
+def _configuration(colors: str):
+    from ezdxf.addons.drawing import config
+
+    return config.Configuration(
+        background_policy=config.BackgroundPolicy.WHITE,
+        color_policy=config.ColorPolicy.BLACK if colors == "mono" else config.ColorPolicy.COLOR,
+        lineweight_policy=config.LineweightPolicy.RELATIVE,
+    )
+
+
+def render_layout(doc: Drawing, layout, budget: Budget, colors: str = "color") -> PyMuPdfBackend:
+    """Record one layout with the ezdxf frontend (budget checked every 200 entities)."""
+    from ezdxf.addons.drawing import Frontend, RenderContext
     from ezdxf.addons.drawing.pymupdf import PyMuPdfBackend
 
     ctx = RenderContext(doc)
     backend = PyMuPdfBackend()
-    cfg = config.Configuration(
-        background_policy=config.BackgroundPolicy.WHITE,
-        color_policy=config.ColorPolicy.COLOR,
-        lineweight_policy=config.LineweightPolicy.RELATIVE,
-    )
-    frontend = Frontend(ctx, backend, config=cfg)
+    frontend = Frontend(ctx, backend, config=_configuration(colors))
     frontend.push_property_override_function(_white_to_black)
     ticker = Ticker(budget, every=200)
 
@@ -72,8 +118,12 @@ def render_modelspace(doc: Drawing, budget: Budget) -> PyMuPdfBackend:
         ticker.tick()
         return True
 
-    frontend.draw_layout(doc.modelspace(), finalize=True, filter_func=keep)
+    frontend.draw_layout(layout, finalize=True, filter_func=keep)
     return backend
+
+
+def render_modelspace(doc: Drawing, budget: Budget, colors: str = "color") -> PyMuPdfBackend:
+    return render_layout(doc, doc.modelspace(), budget, colors)
 
 
 def auto_page(w: float, h: float, entities: int, mm_factor: float) -> tuple[float, float]:
@@ -84,29 +134,114 @@ def auto_page(w: float, h: float, entities: int, mm_factor: float) -> tuple[floa
     return pw, ph
 
 
-def convert(src: str, dst: str, *, budget: Budget, meta: dict) -> None:
+def choose_page(page: str, w: float, h: float, entities: int, mm_factor: float) -> tuple[float, float]:
+    if page == "auto":
+        return auto_page(w, h, entities, mm_factor)
+    pw, ph = PAGE_SIZES_MM[page]
+    return (ph, pw) if w < h else (pw, ph)
+
+
+def _blank_page(width_mm: float, height_mm: float) -> bytes:
+    import pymupdf
+
+    with pymupdf.open() as doc:
+        doc.new_page(width=width_mm * 72.0 / 25.4, height=height_mm * 72.0 / 25.4)
+        return doc.tobytes()
+
+
+def _layout_pdf(doc: Drawing, name: str, budget: Budget, colors: str) -> tuple[bytes, tuple[float, float]]:
+    """One paper-space layout as a one-page PDF in its paper size. A layout whose viewports
+    look at an empty part of model space draws nothing: it becomes a blank sheet, as a CAD
+    program would plot it."""
+    from ezdxf import bbox
+    from ezdxf.addons.drawing import layout as page_layout
+
+    paper = doc.layouts.get(name)
+    if paper.dxf.paper_width > 0 and paper.dxf.paper_height > 0:
+        page = page_layout.Page.from_dxf_layout(paper)
+    else:
+        page = page_layout.Page(*A4_MM, page_layout.Units.mm, margins=page_layout.Margins.all(MARGIN_MM))
+    backend = render_layout(doc, paper, budget, colors)
+    budget.check()
+    # paper space is drawn in paper units: keep 1:1 when the content fits the printable area,
+    # otherwise (inch-based or oversized layouts) fit it to the page
+    ext = bbox.extents(layout_content(paper), fast=True)
+    inner_w = page.width_in_mm - page.margins_in_mm.left - page.margins_in_mm.right
+    inner_h = page.height_in_mm - page.margins_in_mm.top - page.margins_in_mm.bottom
+    one_to_one = False
+    if ext.has_data and inner_w > 0 and inner_h > 0:
+        w, h = float(ext.size.x), float(ext.size.y)
+        fits = w <= inner_w * 1.001 and h <= inner_h * 1.001
+        one_to_one = fits and max(w / inner_w, h / inner_h) >= LAYOUT_FIT_MIN_RATIO
+    settings = page_layout.Settings(fit_page=not one_to_one, scale=1.0)
+    size = (round(page.width_in_mm, 1), round(page.height_in_mm, 1))
+    try:
+        data = backend.get_pdf_bytes(page, settings=settings)
+    except ValueError as exc:
+        if "empty bounding box" not in str(exc):
+            raise
+        print(f"cad-engine: layout {name!r} draws nothing; blank sheet", file=sys.stderr)
+        return _blank_page(*size), size
+    if not data:
+        raise EngineError(f"the PDF backend returned no data for layout {name!r}")
+    return data, size
+
+
+def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto", colors: str = "color",
+            layouts: bool = False) -> None:
     from ezdxf.addons.drawing import layout
 
+    if page not in PAGE_CHOICES:
+        raise ValueError(f"unknown page size {page!r}")
+    if colors not in COLOR_CHOICES:
+        raise ValueError(f"unknown colour mode {colors!r}")
     doc = load_dxf(src)
     msp = doc.modelspace()
     entities = len(msp)
     meta["entities"] = entities
     meta["layers"] = len(doc.layers)
     meta["dxf_version"] = doc.dxfversion
+    meta["layouts"] = []
     w, h = check_not_empty(doc)
     budget.check()
 
-    pw, ph = auto_page(w, h, entities, extents_mm_factor(doc))
-    backend = render_modelspace(doc, budget)
+    pw, ph = choose_page(page, w, h, entities, extents_mm_factor(doc))
+    backend = render_modelspace(doc, budget, colors)
     budget.check()
-    page = layout.Page(pw, ph, layout.Units.mm, margins=layout.Margins.all(MARGIN_MM))
-    pdf_bytes = backend.get_pdf_bytes(page, settings=layout.Settings(fit_page=True))
+    model_page = layout.Page(pw, ph, layout.Units.mm, margins=layout.Margins.all(MARGIN_MM))
+    pdf_bytes = backend.get_pdf_bytes(model_page, settings=layout.Settings(fit_page=True))
     if not pdf_bytes:
         raise EngineError("the PDF backend returned no data")
-    meta["pages"] = 1
+    rendered: list[tuple[str, tuple[float, float]]] = []
+    if layouts:
+        names = paper_layouts(doc)
+        if names:
+            import pymupdf
+
+            merged = pymupdf.open("pdf", pdf_bytes)  # Model space first, keeps its optional content
+            for name in names:
+                budget.check()
+                try:
+                    data, size = _layout_pdf(doc, name, budget, colors)
+                except MemoryError:
+                    raise
+                except Exception as exc:  # one broken layout must not cost the model-space page
+                    print(f"cad-engine: layout {name!r} skipped ({type(exc).__name__}: {exc})",
+                          file=sys.stderr)
+                    meta.setdefault("warnings", []).append(f"layout_skipped:{name}")
+                    continue
+                with pymupdf.open("pdf", data) as part:
+                    merged.insert_pdf(part)
+                rendered.append((name, size))
+            budget.check()
+            pdf_bytes = merged.tobytes(garbage=1, deflate=True)
+            merged.close()
+    meta["pages"] = 1 + len(rendered)
     meta["page_size_mm"] = [pw, ph]
+    meta["layouts"] = [name for name, _ in rendered]
     budget.check()
     outputs.write_part(dst, pdf_bytes)
     outputs.commit(dst)
+    sizes = " ".join(f"{name}={size[0]:g}x{size[1]:g}mm" for name, size in rendered)
     print(f"cad-engine: dxf2pdf entities={entities} extents={w:.1f}x{h:.1f} page={pw:g}x{ph:g}mm "
-          f"pdf={len(pdf_bytes) // 1024}KB", file=sys.stderr)
+          f"colors={colors} layouts=[{sizes}] pdf={len(pdf_bytes) // 1024}KB", file=sys.stderr)

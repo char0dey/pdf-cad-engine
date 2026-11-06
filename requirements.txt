@@ -4,6 +4,8 @@ ezdxf==1.4.5
 pymupdf==1.26.7
 Pillow==12.3.0
 numpy==2.5.4
+# Optional extra [raster] (pdf2dxf --raster-fallback): installed on the servers.
+opencv-python-headless==4.14.0.94
 # Transitive dependencies of ezdxf, pinned for reproducible installs.
 fonttools==4.68.0
 pyparsing==3.3.3

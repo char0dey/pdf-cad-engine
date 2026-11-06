@@ -7,6 +7,8 @@ The preview is drawn from the same primitives that were written to the DXF
 vectors go into one raw PDF content stream of a scratch PyMuPDF page sized to the
 content extents, texts are added on top, and MuPDF rasterises the page once.
 White strokes are drawn black, as a CAD viewer on a white background would.
+Solid fills (pdf2dxf ``--hatch-fills``) are painted below the strokes; dashed linetypes
+(``--linetypes``) are drawn with the dash pattern the DXF linetype produces.
 """
 
 from __future__ import annotations
@@ -24,7 +26,8 @@ _RESOURCES = (
     f"<</Font<</{_FONT_RES}<</Type/Font/Subtype/Type1/BaseFont/Helvetica/Encoding/WinAnsiEncoding>>>>>>"
 )
 
-Style = tuple[tuple[int, int, int], float]  # (rgb 0..255, stroke width in pt)
+# (rgb 0..255, stroke width in pt, dash pattern (on, off) in drawing units or None)
+Style = tuple[tuple[int, int, int], float, "tuple[float, float] | None"]
 
 
 def display_rgb(rgb: tuple[int, int, int]) -> tuple[float, float, float]:
@@ -46,11 +49,17 @@ def _pdf_string(data: bytes) -> str:
 
 
 class PreviewRecorder:
-    """Collects primitives in DXF coordinates (mm, y up) grouped by stroke style."""
+    """Collects primitives in DXF coordinates (y up) grouped by stroke style.
 
-    def __init__(self) -> None:
+    `unit_scale` is the number of drawing units per paper millimetre (pdf2dxf ``--scale`` /
+    ``--units``); stroke widths in pt are converted with it.
+    """
+
+    def __init__(self, unit_scale: float = 1.0) -> None:
+        self.unit_scale = unit_scale
         self.paths: dict[Style, list[tuple[list[tuple[float, float]], bool | None]]] = {}
         self.texts: list[tuple[tuple[float, float], str, float, float, tuple[int, int, int]]] = []
+        self.fills: list[tuple[tuple[int, int, int], list]] = []
 
     def polyline(self, style: Style, pts: list[tuple[float, float]], closed: bool) -> None:
         self.paths.setdefault(style, []).append((pts, closed))
@@ -58,9 +67,15 @@ class PreviewRecorder:
     def bezier(self, style: Style, cps: list[tuple[float, float]]) -> None:
         self.paths.setdefault(style, []).append((cps, None))
 
-    def text(self, insert: tuple[float, float], text: str, size_mm: float, rotation: float,
+    def fill(self, rgb: tuple[int, int, int], loops: list) -> None:
+        """Solid fill (a DXF HATCH: odd parity, true colour, white stays white); loops are
+        lists of ('l', a, b) / ('c', p0, p1, p2, p3) segments."""
+        self.fills.append((rgb, loops))
+
+    def text(self, insert: tuple[float, float], text: str, size: float, rotation: float,
              rgb: tuple[int, int, int]) -> None:
-        self.texts.append((insert, text, size_mm, rotation, rgb))
+        """`size` = font size in drawing units."""
+        self.texts.append((insert, text, size, rotation, rgb))
 
     def render_png(self, bounds: tuple[float, float, float, float],
                    longest_px: int = LONGEST_SIDE_PX) -> bytes:
@@ -81,7 +96,7 @@ class PreviewRecorder:
         doc = pymupdf.open()
         page = doc.new_page(width=page_w, height=page_h)
         text_stream, unicode_texts = self._text_stream(ox, oy, scale)
-        stream = self._vector_stream(ox, oy, scale) + text_stream
+        stream = self._fill_stream(ox, oy, scale) + self._vector_stream(ox, oy, scale) + text_stream
         xref = doc.get_new_xref()
         doc.update_object(xref, "<<>>")
         doc.update_stream(xref, stream.encode("ascii"))
@@ -93,12 +108,36 @@ class PreviewRecorder:
         return pix.tobytes("png")
 
     # -- vectors -------------------------------------------------------------------------
+    def _fill_stream(self, ox: float, oy: float, s: float) -> str:
+        if not self.fills:
+            return ""
+        out = ["q\n"]
+        for rgb, loops in self.fills:
+            r, g, b = (v / 255.0 for v in rgb)
+            out.append(f"{r:.3f} {g:.3f} {b:.3f} rg\n")
+            for loop in loops:
+                x, y = loop[0][1]
+                seg = [f"{(x - ox) * s:.2f} {(y - oy) * s:.2f} m"]
+                for item in loop:
+                    if item[0] == "l":
+                        x, y = item[2]
+                        seg.append(f"{(x - ox) * s:.2f} {(y - oy) * s:.2f} l")
+                    else:
+                        coords = " ".join(f"{(px - ox) * s:.2f} {(py - oy) * s:.2f}" for px, py in item[2:5])
+                        seg.append(coords + " c")
+                seg.append("h\n")
+                out.append(" ".join(seg))
+            out.append("f*\n")
+        out.append("Q\n")
+        return "".join(out)
+
     def _vector_stream(self, ox: float, oy: float, s: float) -> str:
         out = ["q 1 J 1 j\n"]
-        for (rgb, width_pt), items in self.paths.items():
+        for (rgb, width_pt, dash), items in self.paths.items():
             r, g, b = display_rgb(rgb)
-            lw = max(width_pt * PT2MM * s, MIN_STROKE_PX)
-            out.append(f"{r:.3f} {g:.3f} {b:.3f} RG {lw:.3f} w\n")
+            lw = max(width_pt * PT2MM * self.unit_scale * s, MIN_STROKE_PX)
+            pattern = f"[{dash[0] * s:.3f} {max(dash[1] * s, 0.01):.3f}] 0 d" if dash else "[] 0 d"
+            out.append(f"{r:.3f} {g:.3f} {b:.3f} RG {lw:.3f} w {pattern}\n")
             pending = 0
             for pts, closed in items:
                 if closed is None:
@@ -131,8 +170,8 @@ class PreviewRecorder:
         the rest is returned for `_unicode_text`."""
         out = []
         unicode_texts: list = []
-        for (x, y), text, size_mm, rotation, rgb in self.texts:
-            size_px = size_mm * s
+        for (x, y), text, size, rotation, rgb in self.texts:
+            size_px = size * s
             if size_px < MIN_TEXT_PX:
                 continue
             try:

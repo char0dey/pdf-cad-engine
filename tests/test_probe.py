@@ -123,3 +123,18 @@ def test_sniff():
     assert sniff(b"\xef\xbb\xbf0\nSECTION\n2\nENTITIES\n") == "ascii"
     assert sniff(b"hello world\n0\nSECTIONS are great\n") is None
     assert sniff(b"%PDF-1.7\n") is None
+
+
+def test_probe_dxf_layouts(layouts_dxf, sample_plan_dxf):
+    run = run_engine("probe-dxf", "--in", layouts_dxf)
+    assert run.returncode == 0, run.stderr
+    assert run.meta["layouts"] == ["Plan A3", "Detail"]
+    run = run_engine("probe-dxf", "--in", sample_plan_dxf)
+    assert run.meta["layouts"] == []
+
+
+def test_probe_rejects_conversion_options(sample_plan_dxf, scan_pdf):
+    run = run_engine("probe-dxf", "--in", sample_plan_dxf, "--layouts")
+    assert run.returncode == 5
+    run = run_engine("probe-pdf", "--in", scan_pdf, "--raster-fallback")
+    assert run.returncode == 5

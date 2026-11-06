@@ -209,6 +209,69 @@ def many_pages_pdf(gen) -> Path:
     return make_sample.build_many_pages_pdf(gen / "eighty_pages.pdf", pages=80)
 
 
+# -- phase 2 (engine 1.1) inputs ----------------------------------------------------------
+@pytest.fixture(scope="session")
+def layouts_dxf(gen) -> Path:
+    return make_sample.build_layouts_dxf(gen / "plan_layouts.dxf")
+
+
+@pytest.fixture(scope="session")
+def circles_pdf(gen) -> Path:
+    return make_sample.build_circles_pdf(gen / "circles.pdf")
+
+
+@pytest.fixture(scope="session")
+def fills_pdf(gen) -> Path:
+    return make_sample.build_fills_pdf(gen / "fills.pdf")
+
+
+@pytest.fixture(scope="session")
+def dashes_pdf(gen) -> Path:
+    return make_sample.build_dashes_pdf(gen / "dashes.pdf")
+
+
+@pytest.fixture(scope="session")
+def merge_pdf(gen) -> Path:
+    return make_sample.build_merge_pdf(gen / "merge.pdf")
+
+
+@pytest.fixture(scope="session")
+def scale_pdf(gen) -> Path:
+    return make_sample.build_scale_pdf(gen / "scale.pdf")
+
+
+@pytest.fixture(scope="session")
+def scan_drawing_pdf(gen) -> Path:
+    return make_sample.build_scan_drawing_pdf(gen / "scan_drawing.pdf")
+
+
+@pytest.fixture(scope="session")
+def mixed_pdf(gen) -> Path:
+    return make_sample.build_mixed_pdf(gen / "mixed.pdf")
+
+
+def has_cv2() -> bool:
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def pixel_difference(a: Path, b: Path, threshold: int = 64) -> float:
+    """Share of pixels whose colour differs by more than `threshold` in any channel."""
+    import numpy as np
+    import pymupdf
+
+    def pixels(path: Path):
+        pix = pymupdf.Pixmap(str(path))
+        return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)[:, :, :3]
+
+    pa, pb = pixels(a), pixels(b)
+    assert pa.shape == pb.shape, (pa.shape, pb.shape)
+    return float((np.abs(pa.astype(int) - pb.astype(int)).max(axis=2) > threshold).mean())
+
+
 # -- committed fixtures and optional real-world samples -----------------------------------
 @pytest.fixture(scope="session")
 def antrag_pdf(gen) -> Path:
@@ -224,13 +287,15 @@ def antrag_pdf(gen) -> Path:
         "Familienstand / Marital status / État civil", "Anschrift / Address / Adresse",
         "Straße, Hausnummer", "Postleitzahl, Ort", "Telefon / E-Mail", "Reisepass Nr. / Passport no.",
         "ausgestellt am / issued on", "gültig bis / valid until", "Zweck des Aufenthalts / Purpose of stay",
-        "Arbeitgeber / Employer / Employeur", "Einkommen / Income / Revenu", "Krankenversicherung / Health insurance",
+        "Arbeitgeber / Employer / Employeur", "Einkommen / Income / Revenu",
+        "Krankenversicherung / Health insurance",
         "Unterschrift / Signature", "Datum / Date",
     ]
     doc = pymupdf.open()
     for p in range(4):
         page = doc.new_page(width=595, height=842)
-        page.insert_text((50, 60), f"Antrag auf Erteilung eines Aufenthaltstitels — Seite {p + 1}/4", fontsize=14, fontname="helv")
+        page.insert_text((50, 60), f"Antrag auf Erteilung eines Aufenthaltstitels — Seite {p + 1}/4",
+                         fontsize=14, fontname="helv")
         y = 100.0
         for label in labels:
             page.insert_text((50, y), label, fontsize=9, fontname="helv", color=(0, 0, 0.4))

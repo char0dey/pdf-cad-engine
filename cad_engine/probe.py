@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from cad_engine import outputs
 from cad_engine.budget import Budget
-from cad_engine.dxf2pdf import check_not_empty, render_modelspace
+from cad_engine.dxf2pdf import check_not_empty, paper_layouts, render_modelspace
 from cad_engine.dxfio import load_dxf
 from cad_engine.errors import EngineError, InputError
 from cad_engine.pdf2dxf import clean_text, open_pdf, text_flags, visible
@@ -59,6 +59,7 @@ def probe_dxf(src: str, *, budget: Budget, meta: dict) -> None:
     meta["entities"] = len(doc.modelspace())
     meta["layers"] = len(doc.layers)
     meta["dxf_version"] = doc.dxfversion
+    meta["layouts"] = paper_layouts(doc)
     try:
         check_not_empty(doc)
         meta["empty"] = False

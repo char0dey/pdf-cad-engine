@@ -142,3 +142,123 @@ def test_floorplan(floorplan_dxf, tmp_path):
 def test_ceco(ceco_dxf, tmp_path):
     meta, pdf = render_ok(ceco_dxf, tmp_path)
     assert meta["page_size_mm"] in ([297.0, 210.0], [210.0, 297.0], [420.0, 297.0], [297.0, 420.0])
+
+
+# -- phase 2 (engine 1.1): --page, --colors, --layouts -----------------------------------------
+MM2PT = 72.0 / 25.4
+
+
+def render_pages(dxf, tmp_path, *extra, name=None):
+    out = tmp_path / ((name or dxf.stem) + ".pdf")
+    run = run_engine("dxf2pdf", "--in", dxf, "--out", out, *extra)
+    assert run.returncode == 0, run.stderr
+    pdf = pymupdf.open(out)
+    assert pdf.page_count == run.meta["pages"]
+    for page in pdf:
+        assert non_white_fraction(page.get_pixmap(dpi=50).tobytes("png")) > 0.001
+    return run.meta, pdf
+
+
+@pytest.mark.parametrize(
+    ("page", "expected_mm"),
+    [("a4", (297.0, 210.0)), ("a3", (420.0, 297.0)), ("a2", (594.0, 420.0)), ("a1", (841.0, 594.0))],
+)
+def test_page_option(sample_plan_dxf, tmp_path, page, expected_mm):
+    meta, pdf = render_pages(sample_plan_dxf, tmp_path, "--page", page)
+    assert meta["page_size_mm"] == list(expected_mm)
+    assert_size(page_size(pdf), (expected_mm[0] * MM2PT, expected_mm[1] * MM2PT))
+
+
+def test_page_option_overrides_auto_and_keeps_orientation(big_extent_dxf, sample_plan_dxf, tmp_path):
+    meta, _ = render_pages(big_extent_dxf, tmp_path, "--page", "a4")  # auto would choose A3
+    assert meta["page_size_mm"] == [297.0, 210.0]
+    meta, _ = render_pages(FIXTURES / "dimensions.dxf", tmp_path, "--page", "a3")  # portrait drawing
+    assert meta["page_size_mm"] == [297.0, 420.0]
+    meta, _ = render_pages(sample_plan_dxf, tmp_path, "--page", "auto", name="auto")
+    assert meta["page_size_mm"] == [297.0, 210.0]
+
+
+def _strokes(pdf):
+    colors, widths, fills = set(), [], set()
+    for page in pdf:
+        for d in page.get_drawings():
+            if d.get("color") is not None:
+                colors.add(tuple(round(c, 3) for c in d["color"]))
+                widths.append(round(d.get("width") or 0, 3))
+            if d.get("fill") is not None:
+                fills.add(tuple(round(c, 3) for c in d["fill"]))
+    return colors, sorted(widths), fills
+
+
+def test_mono_colors(sample_plan_dxf, tmp_path):
+    _, color_pdf = render_pages(sample_plan_dxf, tmp_path, name="color")
+    meta, mono_pdf = render_pages(sample_plan_dxf, tmp_path, "--colors", "mono", name="mono")
+    colors, widths, fills = _strokes(color_pdf)
+    mono_colors, mono_widths, mono_fills = _strokes(mono_pdf)
+    assert len(colors) > 1
+    assert mono_colors == {(0.0, 0.0, 0.0)}
+    assert mono_fills <= {(0.0, 0.0, 0.0), (1.0, 1.0, 1.0)}  # black ink, white paper
+    assert mono_widths == widths  # lineweights are kept
+    assert meta["page_size_mm"] == [297.0, 210.0]
+
+
+def test_layouts_extra_pages(layouts_dxf, tmp_path):
+    meta, pdf = render_pages(layouts_dxf, tmp_path, "--layouts")
+    assert meta["pages"] == 3 and pdf.page_count == 3
+    assert meta["layouts"] == ["Plan A3", "Detail"]  # Layout1 is empty and skipped
+    assert_size((pdf[0].rect.width, pdf[0].rect.height), A4_LANDSCAPE_PT)  # Model space, auto
+    assert_size((pdf[1].rect.width, pdf[1].rect.height), A3_LANDSCAPE_PT)
+    assert_size((pdf[2].rect.width, pdf[2].rect.height), A4_LANDSCAPE_PT)
+    # the "Detail" viewport is zoomed in on the door: its red door arc is larger than on page 1
+    def door_width(page):
+        doors = [d["rect"].width for d in page.get_drawings() if d.get("color") == (1.0, 0.0, 0.0)]
+        return max(doors)
+
+    assert door_width(pdf[2]) > 2 * door_width(pdf[0])
+
+
+def test_layouts_with_mono_and_page(layouts_dxf, tmp_path):
+    meta, pdf = render_pages(layouts_dxf, tmp_path, "--layouts", "--colors", "mono", "--page", "a3")
+    assert meta["pages"] == 3
+    assert meta["page_size_mm"] == [420.0, 297.0]
+    colors, _, _ = _strokes(pdf)
+    assert colors == {(0.0, 0.0, 0.0)}
+
+
+def test_layouts_flag_off_or_no_paper_space(layouts_dxf, sample_plan_dxf, tmp_path):
+    meta, pdf = render_pages(layouts_dxf, tmp_path, name="off")
+    assert (meta["pages"], meta["layouts"]) == (1, [])
+    meta, pdf = render_pages(sample_plan_dxf, tmp_path, "--layouts", name="none")
+    assert (meta["pages"], meta["layouts"]) == (1, [])
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["--page", "a0"], ["--colors", "grey"], ["--arcs"], ["--scale", "1-100"], ["--raster-fallback"]],
+)
+def test_dxf2pdf_option_errors(sample_plan_dxf, tmp_path, args):
+    run = run_engine("dxf2pdf", "--in", sample_plan_dxf, "--out", tmp_path / "x.pdf", *args)
+    assert run.returncode == 5
+    assert run.meta["message"].startswith("usage error")
+    assert not (tmp_path / "x.pdf").exists()
+
+
+def test_layout_viewing_empty_model_area_is_a_blank_sheet(sample_plan_dxf, tmp_path):
+    import ezdxf
+
+    doc = ezdxf.readfile(sample_plan_dxf)
+    sheet = doc.layouts.new("Empty view")
+    sheet.page_setup(size=(297, 210), margins=(10, 10, 10, 10), units="mm")
+    sheet.add_viewport(center=(148.5, 105), size=(200, 150), view_center_point=(900_000, 900_000),
+                       view_height=1000)
+    path = tmp_path / "empty_view.dxf"
+    doc.saveas(path)
+    probe = run_engine("probe-dxf", "--in", path)
+    assert probe.meta["layouts"] == ["Empty view"]
+    out = tmp_path / "empty_view.pdf"
+    run = run_engine("dxf2pdf", "--in", path, "--out", out, "--layouts")
+    assert run.returncode == 0, run.stderr
+    assert (run.meta["pages"], run.meta["layouts"]) == (2, ["Empty view"])
+    pdf = pymupdf.open(out)
+    assert_size((pdf[1].rect.width, pdf[1].rect.height), A4_LANDSCAPE_PT)
+    assert non_white_fraction(pdf[1].get_pixmap(dpi=50).tobytes("png")) == 0.0
