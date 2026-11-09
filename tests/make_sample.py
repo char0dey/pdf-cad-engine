@@ -7,7 +7,9 @@
 ANSI31 hatch, block inserts, 7 layers, DASHED linetype); `build_layouts_dxf` adds two
 paper-space layouts with viewports. The PDF builders create small vector / scan-like /
 multi-page / layered PDFs with PyMuPDF, plus the phase-2 inputs (circles and arcs,
-fills, dashed runs, duplicates, scale, scanned drawing, mixed vector + scan).
+fills, dashed runs, duplicates, scale, scanned drawing, mixed vector + scan) and the
+engine 1.2 drawings with external content (`build_refs_dxf`: xrefs, underlays, images,
+AutoCAD Architecture classes).
 
 Run directly to write the sample plan: ``python tests/make_sample.py out.dxf``.
 """
@@ -150,6 +152,112 @@ def build_big_extent_dxf(out: Path) -> Path:
     msp = doc.modelspace()
     msp.add_lwpolyline([(0, 0), (45000, 0), (45000, 30000), (0, 30000)], close=True)
     msp.add_line((0, 0), (45000, 30000))
+    doc.saveas(out)
+    return out
+
+
+# -- missing content (engine 1.2) ---------------------------------------------------------
+def add_aec_classes(path: Path, names=("AEC_WALL", "AEC_DOOR"), *, objects=("AECB_DISP_PROPS_DUCT",)) -> Path:
+    """Insert CLASS records of AutoCAD vertical products into the CLASSES section of an ASCII
+    DXF (ezdxf writes only the classes it knows): ``names`` as entity classes (281 = 1),
+    ``objects`` as non-entity classes (281 = 0), both with instance count 0 as ACadSharp
+    writes them."""
+    text = path.read_text(encoding="utf-8")
+    marker = "  2\nCLASSES\n"
+    assert marker in text, "no CLASSES section"
+
+    def record(name: str, is_entity: int) -> str:
+        return (f"  0\nCLASS\n  1\n{name}\n  2\nAecDb{name.split('_', 1)[1].title()}\n"
+                f"  3\nAecArchBase|Product Desc:     Autodesk Architecture\n 90\n4095\n 91\n0\n"
+                f"280\n0\n281\n{is_entity}\n")
+
+    records = "".join(record(n, 1) for n in names) + "".join(record(n, 0) for n in objects)
+    path.write_text(text.replace(marker, marker + records, 1), encoding="utf-8")
+    return path
+
+
+def build_refs_dxf(out: Path, *, xrefs=(), overlays=(), unused_xrefs=(), bound=(), nested_xrefs=(),
+                   underlays=(), images=(), image_inserts: int = 1, aec=(), lines: bool = True,
+                   fmt: str = "asc") -> Path:
+    """A drawing with external content: ``xrefs`` / ``overlays`` / ``nested_xrefs`` are
+    ``(block name, path)`` pairs inserted into model space (nested: inside a block FRAME that
+    model space inserts), ``unused_xrefs`` are defined but never inserted, ``bound`` are
+    ordinary blocks (a bound xref) inserted into model space; ``underlays`` are PDF underlay
+    paths, ``images`` raster image paths (each inserted ``image_inserts`` times); ``aec``
+    adds AutoCAD Architecture entity classes (ASCII only); ``lines`` adds a line to draw."""
+    import ezdxf
+
+    doc = ezdxf.new("R2010")
+    msp = doc.modelspace()
+    if lines:
+        msp.add_line((0, 0), (1000, 500))
+    x = 0
+    for name, path in xrefs:
+        doc.add_xref_def(path, name)
+        msp.add_blockref(name, (x, 0))
+        x += 100
+    for name, path in overlays:
+        doc.add_xref_def(path, name, flags=4 | 8 | 16)
+        msp.add_blockref(name, (x, 0))
+        x += 100
+    for name, path in unused_xrefs:
+        doc.add_xref_def(path, name)
+    for name in bound:
+        blk = doc.blocks.new(name)
+        blk.add_circle((0, 0), 50)
+        msp.add_blockref(name, (x, 0))
+        x += 100
+    if nested_xrefs:
+        frame = doc.blocks.new("FRAME")
+        for name, path in nested_xrefs:
+            doc.add_xref_def(path, name)
+            frame.add_blockref(name, (0, 0))
+        msp.add_blockref("FRAME", (x, 0))
+    for i, path in enumerate(underlays):
+        underlay_def = doc.add_underlay_def(path, fmt="pdf", name=str(i + 1))
+        msp.add_underlay(underlay_def, insert=(i * 300, 0), scale=1.0)
+    for path in images:
+        image_def = doc.add_image_def(filename=path, size_in_pixel=(640, 480))
+        for i in range(image_inserts):
+            msp.add_image(image_def, insert=(i * 700, 1000), size_in_units=(640, 480))
+    doc.saveas(out, fmt=fmt)
+    if aec:
+        add_aec_classes(out, aec)
+    return out
+
+
+def build_underlay_only_dxf(out: Path) -> Path:
+    """Model space holds only three PDF underlays (committed as tests/fixtures/underlay-only.dxf)."""
+    return build_refs_dxf(out, underlays=(r"..\pdf\site-plan.pdf", r"..\pdf\site-plan.pdf",
+                                          r"C:\Projects\Client\survey.pdf"), lines=False)
+
+
+def build_heavy_dxf(out: Path, *, lines: int = 20_000, hatches: int = 0, hatch_scale: float = 0.2) -> Path:
+    """The pattern of the drawings that ran out of the background budget on 2026-11-09 (engine 1.2,
+    design D8), generated: ``lines`` short lines as inserts of a 50-line block over 20 layers, plus
+    ``hatches`` small ANSI31 hatches at ``hatch_scale`` (dense pattern lines)."""
+    import random
+
+    import ezdxf
+
+    doc = ezdxf.new("R2010")
+    msp = doc.modelspace()
+    rnd = random.Random(7)
+    for i in range(20):
+        doc.layers.add(f"L{i}", color=i % 7 + 1)
+    part = doc.blocks.new("PART")
+    for i in range(50):
+        x, y = rnd.uniform(0, 1000), rnd.uniform(0, 1000)
+        end = (x + rnd.uniform(-80, 80), y + rnd.uniform(-80, 80))
+        part.add_line((x, y), end, dxfattribs={"layer": f"L{i % 20}"})
+    for i in range(lines // 50):
+        msp.add_blockref("PART", ((i % 40) * 1100, (i // 40) * 1100))
+    for i in range(hatches):
+        hatch = msp.add_hatch(color=i % 7 + 1, dxfattribs={"layer": f"L{i % 20}"})
+        hatch.set_pattern_fill("ANSI31", scale=hatch_scale)
+        x, y = (i % 20) * 120, (i // 20) * 120 - 5000
+        square = [(x, y), (x + 100, y), (x + 100, y + 100), (x, y + 100)]
+        hatch.paths.add_polyline_path(square, is_closed=True)
     doc.saveas(out)
     return out
 

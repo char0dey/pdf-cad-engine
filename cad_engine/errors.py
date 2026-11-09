@@ -15,6 +15,8 @@ INPUT_ERROR_CODES = frozenset(
     {
         "no_vectors",
         "empty_drawing",
+        "aec_objects",
+        "external_refs_only",
         "too_many_pages",
         "dwg_not_dxf",
         "too_complex",

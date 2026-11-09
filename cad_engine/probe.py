@@ -3,7 +3,8 @@
 """Fast input analysis (probe-pdf, probe-dxf) and the DXF preview (preview-dxf).
 
 Probes report facts and exit 0; they exit 2 only when the input cannot be
-identified or read (``unsupported_input``, ``dwg_not_dxf``).
+identified or read (``unsupported_input``, ``dwg_not_dxf``). An empty drawing is a fact
+(``empty`` + ``empty_reason``), not an exit 2.
 """
 
 from __future__ import annotations
@@ -11,9 +12,10 @@ from __future__ import annotations
 from cad_engine import outputs
 from cad_engine.budget import Budget
 from cad_engine.dxf2pdf import check_not_empty, paper_layouts, render_modelspace
-from cad_engine.dxfio import load_dxf
+from cad_engine.dxfio import check_dxf_signature, load_dxf
 from cad_engine.errors import EngineError, InputError
 from cad_engine.pdf2dxf import clean_text, open_pdf, text_flags, visible
+from cad_engine.scan import apply_to_meta, empty_reason, safe_scan
 
 PROBE_PDF_PAGES = 5
 PREVIEW_LONGEST_PX = 1400
@@ -53,7 +55,24 @@ def probe_pdf(src: str, *, budget: Budget, meta: dict) -> None:
     meta["text_as_outlines"] = has_drawings and texts == 0
 
 
-def probe_dxf(src: str, *, budget: Budget, meta: dict) -> None:
+def probe_dxf(src: str, *, budget: Budget, meta: dict, light: bool = False) -> None:
+    """Facts about a DXF: the content scan (`cad_engine.scan`) and, unless ``light``, the
+    loaded document (entities, layers, layouts, extents). ``empty`` is true when there is
+    nothing to draw, ``empty_reason`` then says why (the code `dxf2pdf` would refuse with).
+    ``light`` (big files) skips loading: ``entities`` / ``empty`` come from the scan alone and
+    stay null when the scan failed or the file is cut off."""
+    check_dxf_signature(src)
+    scan = safe_scan(src, budget)
+    apply_to_meta(meta, scan)
+    budget.check()
+    if light:
+        if scan is not None:
+            meta["entities"] = scan.ms_entities
+        if scan is not None and scan.complete:
+            meta["empty"] = scan.nothing_to_draw
+            if scan.nothing_to_draw:
+                meta["empty_reason"] = empty_reason(scan)
+        return
     doc = load_dxf(src)
     budget.check()
     meta["entities"] = len(doc.modelspace())
@@ -61,10 +80,11 @@ def probe_dxf(src: str, *, budget: Budget, meta: dict) -> None:
     meta["dxf_version"] = doc.dxfversion
     meta["layouts"] = paper_layouts(doc)
     try:
-        check_not_empty(doc)
+        check_not_empty(doc, scan)
         meta["empty"] = False
-    except InputError:
+    except InputError as exc:
         meta["empty"] = True
+        meta["empty_reason"] = exc.code
 
 
 def _preview_page(w: float, h: float):

@@ -7,6 +7,7 @@
                             [pdf2dxf: --arcs --hatch-fills --linetypes --merge --raster-fallback
                                       --scale asis|1-50|1-100|1-200 --units mm|inch]
                             [dxf2pdf: --page auto|a4|a3|a2|a1 --colors color|mono --layouts]
+                            [probe-dxf: --light]
     python -I -m cad_engine --version
 
 stdout carries exactly one JSON line (the meta) at the end of every run;
@@ -41,6 +42,7 @@ COMMANDS = ("pdf2dxf", "dxf2pdf", "probe-pdf", "probe-dxf", "preview-dxf")
 NEEDS_OUT = frozenset({"pdf2dxf", "dxf2pdf", "preview-dxf"})
 PDF2DXF_FLAGS = ("arcs", "hatch_fills", "linetypes", "merge", "raster_fallback", "scale", "units")
 DXF2PDF_FLAGS = ("page", "colors", "layouts")
+PROBE_DXF_FLAGS = ("light",)
 DEFAULT_BUDGET_MS = 90_000
 DEFAULT_MEMORY_MB = 2048
 MEMORY_ENV = "CAD_ENGINE_MEMORY_MB"  # operational override of the address-space limit
@@ -84,6 +86,9 @@ def build_parser() -> argparse.ArgumentParser:
     dxf.add_argument("--colors", choices=("color", "mono"), help="colours (default color)")
     dxf.add_argument("--layouts", action="store_true", default=None,
                      help="paper-space layouts as extra pages after Model space")
+    probe = parser.add_argument_group("probe-dxf options")
+    probe.add_argument("--light", action="store_true", default=None,
+                       help="content scan only, without loading the drawing (big files)")
     return parser
 
 
@@ -106,6 +111,11 @@ def new_meta() -> dict:
         "dxf_version": None,
         "page_size_mm": None,
         "layouts": None,
+        "scanned": None,
+        "missing": None,
+        "ms_entities": None,
+        "ms_drawable": None,
+        "empty_reason": None,
         "warnings": [],
         "ms": None,
         "code": None,
@@ -173,7 +183,8 @@ def _check_paths(args: argparse.Namespace) -> None:
         raise UsageError(f"usage error: {args.command} requires --out")
     if args.preview and args.command != "pdf2dxf":
         raise UsageError("usage error: --preview is only supported by pdf2dxf")
-    for command, names in (("pdf2dxf", PDF2DXF_FLAGS), ("dxf2pdf", DXF2PDF_FLAGS)):
+    command_flags = (("pdf2dxf", PDF2DXF_FLAGS), ("dxf2pdf", DXF2PDF_FLAGS), ("probe-dxf", PROBE_DXF_FLAGS))
+    for command, names in command_flags:
         used = [name for name in names if getattr(args, name) is not None]
         if used and args.command != command:
             flags = ", ".join("--" + name.replace("_", "-") for name in used)
@@ -217,7 +228,7 @@ def _dispatch(args: argparse.Namespace, budget: Budget, meta: dict) -> None:
     elif args.command == "probe-dxf":
         from cad_engine.probe import probe_dxf
 
-        probe_dxf(args.input, budget=budget, meta=meta)
+        probe_dxf(args.input, budget=budget, meta=meta, light=bool(args.light))
     elif args.command == "preview-dxf":
         from cad_engine.probe import preview_dxf
 

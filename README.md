@@ -29,8 +29,8 @@ warning `raster_fallback_unavailable` in the meta instead of tracing (see below)
 ```
 python -I -m cad_engine <command> --in <file> [--out <file>] [--preview <png>]
                         [--meta <path>] [--budget-ms N] [--tmp <dir>]
-                        [pdf2dxf options] [dxf2pdf options]
-python -I -m cad_engine --version          # prints "1.1.0"
+                        [pdf2dxf options] [dxf2pdf options] [--light]
+python -I -m cad_engine --version          # prints "1.2.0"
 cad-engine ...                             # console script, same arguments
 ```
 
@@ -39,7 +39,7 @@ cad-engine ...                             # console script, same arguments
 | `pdf2dxf`     | PDF   | DXF (R2010, mm)   | `--preview out.png`: PNG of the extracted geometry |
 | `dxf2pdf`     | DXF   | PDF (1 page; + layouts) | ASCII or binary DXF; damaged files are recovered |
 | `probe-pdf`   | PDF   | —                 | pages, `has_vectors` / `text_entities` on the first 5 pages |
-| `probe-dxf`   | DXF   | —                 | `entities`, `empty`, `dxf_version`, `layers`, `layouts` |
+| `probe-dxf`   | DXF   | —                 | `entities`, `empty` / `empty_reason`, `dxf_version`, `layers`, `layouts`, the content scan; `--light`: the scan only |
 | `preview-dxf` | DXF   | PNG               | model space, longest side 1400 px, white background |
 
 Options:
@@ -91,7 +91,7 @@ renamed on success; on any failure the outputs are removed (no partial results).
 | Code | Meaning | `code` in meta |
 |------|---------|----------------|
 | 0 | success | `null` |
-| 2 | unusable input | `no_vectors`, `empty_drawing`, `too_many_pages`, `dwg_not_dxf`, `too_complex`, `unsupported_input` |
+| 2 | unusable input | `no_vectors`, `empty_drawing`, `aec_objects`, `external_refs_only`, `too_many_pages`, `dwg_not_dxf`, `too_complex`, `unsupported_input` |
 | 3 | time budget exceeded | `budget_exceeded` |
 | 4 | memory limit hit | `memory_limit` |
 | 5 | any other failure: missing/unreadable input, usage error, bug (traceback on stderr) | `engine_error` |
@@ -103,12 +103,37 @@ Input error codes:
 - `too_many_pages` — `pdf2dxf`: more than 50 pages (checked before converting).
 - `too_complex` — `pdf2dxf`: more than 500 000 DXF entities.
 - `dwg_not_dxf` — the file starts with a DWG signature (`AC10xx`), checked before parsing.
-- `empty_drawing` — `dxf2pdf` / `preview-dxf`: model space has no entities or no extents.
+- `aec_objects`, `external_refs_only`, `empty_drawing` (1.2) — `dxf2pdf`: nothing to draw in model
+  space (no entities, no extents, or only underlays / images / xref inserts), with the reason by
+  priority: `aec_objects` when the content scan found AutoCAD Architecture / MEP / Civil 3D entity
+  classes (their objects are not in the DXF), else `external_refs_only` when it found xrefs,
+  underlays or images, else `empty_drawing`. `preview-dxf` refuses an empty drawing with
+  `empty_drawing` only. The meta of the refusal carries the scan (`missing`).
 - `unsupported_input` — not a PDF / not a DXF / password-protected PDF / unrecoverable DXF.
 
 Probes report facts and exit 0; they exit 2 only for `unsupported_input` and `dwg_not_dxf`
 (`probe-pdf` reports `pages` and leaves the 50-page limit to the caller; `probe-dxf`
-reports `empty: true` instead of failing).
+reports `empty: true` and `empty_reason` — the code `dxf2pdf` would refuse with — instead of failing).
+
+### Content scan (1.2)
+
+`probe-dxf` and `dxf2pdf` first scan the DXF in one pass over its group codes (ASCII or
+binary, no document is built) for content a PDF of it cannot show:
+
+- `xrefs` — blocks flagged as xref (70 & 4) or overlay (70 & 8) that are inserted at least once
+  anywhere (model space, a paper-space layout, another block); a bound xref is an ordinary
+  block, an xref nobody inserts does not count;
+- `underlays` — PDF / DWF / DGN underlay definitions referenced (group 340) by an underlay entity;
+- `images` — IMAGEDEF objects referenced by an IMAGE entity (two inserts of one image = one name);
+- `aec` — product families of registered entity classes (281 = 1): `AEC_` / `AECS_` →
+  `architecture`, `AECB_` → `mep`, `AECC_` → `civil`. A converter that does not know these
+  objects keeps the classes and drops the objects; how many there were is unknown.
+
+File names are base names (`C:\Projects\plan.dwg` → `plan.dwg`), unique, in order of
+appearance. A scan that fails sets `scanned: false` and reports nothing — it never stops
+the command. `probe-dxf --light` runs only the scan (for big files: ≈ 2 s for 40 MB on a
+laptop, against ≈ 16 s for the full probe): `entities` is the scan's model-space count,
+`empty` comes from `ms_drawable == 0`, and both stay `null` for a file cut off before `EOF`.
 
 ### JSON meta
 
@@ -116,7 +141,7 @@ All keys are always present; `null` when not applicable to the command.
 
 | Key | Type | Set by |
 |-----|------|--------|
-| `version` | string | all (`"1.1.0"`) |
+| `version` | string | all (`"1.2.0"`) |
 | `command` | string | all |
 | `pages` | int | `pdf2dxf`, `probe-pdf`, `dxf2pdf` (PDF pages written: 1 + layouts) |
 | `entities` | int | `pdf2dxf` (DXF entities written), `dxf2pdf` / `probe-dxf` / `preview-dxf` (model space) |
@@ -129,7 +154,11 @@ All keys are always present; `null` when not applicable to the command.
 | `recognized` | object | `pdf2dxf` — `{"circles", "arcs", "hatches", "linetypes", "merged"}` counts (all 0 with the flags off): CIRCLE / ARC / HATCH entities written, entities given a DASHED/DOT linetype, entities saved by `--merge` (joined pieces + dropped duplicates) |
 | `scale` | string | `pdf2dxf` — `asis`, `1-50`, `1-100`, `1-200` |
 | `units` | string | `pdf2dxf` — `mm`, `inch` |
-| `empty` | bool | `probe-dxf` |
+| `empty` | bool | `probe-dxf` — nothing to draw in model space |
+| `empty_reason` | string | `probe-dxf` with `empty: true` — `aec_objects`, `external_refs_only` or `empty_drawing` |
+| `scanned` | bool | `probe-dxf`, `dxf2pdf` — the content scan finished (`false`: it failed, no findings) |
+| `missing` | object | `probe-dxf`, `dxf2pdf` — `{"xrefs", "underlays", "images": [file names], "aec": [families]}` |
+| `ms_entities`, `ms_drawable` | int | `probe-dxf`, `dxf2pdf` — model-space entities seen by the scan, and those that draw something (not underlays, images or xref inserts) |
 | `dxf_version` | string | DXF commands, e.g. `"AC1024"` |
 | `page_size_mm` | [w, h] | `dxf2pdf` — model-space page, e.g. `[297.0, 210.0]` |
 | `layouts` | string[] | `dxf2pdf` — paper-space layouts rendered as extra pages (`[]` without `--layouts`); `probe-dxf` — paper-space layouts with content |
@@ -143,8 +172,8 @@ Examples (`pdf2dxf --arcs --hatch-fills --linetypes --merge --raster-fallback` o
 plan PDF; `dxf2pdf --layouts` on a plan with two paper-space layouts):
 
 ```json
-{"version":"1.1.0","command":"pdf2dxf","pages":1,"entities":1273,"layers":8,"text_entities":0,"images":0,"has_vectors":true,"text_as_outlines":true,"traced_pages":[],"recognized":{"circles":1,"arcs":4,"hatches":10,"linetypes":179,"merged":3},"scale":"asis","units":"mm","empty":null,"dxf_version":null,"page_size_mm":null,"layouts":null,"warnings":[],"ms":319,"code":null,"message":null}
-{"version":"1.1.0","command":"dxf2pdf","pages":3,"entities":19,"layers":9,"text_entities":null,"images":null,"has_vectors":null,"text_as_outlines":null,"traced_pages":null,"recognized":null,"scale":null,"units":null,"empty":null,"dxf_version":"AC1024","page_size_mm":[297.0,210.0],"layouts":["Plan A3","Detail"],"warnings":[],"ms":863,"code":null,"message":null}
+{"version":"1.2.0","command":"pdf2dxf","pages":1,"entities":1273,"layers":8,"text_entities":0,"images":0,"has_vectors":true,"text_as_outlines":true,"traced_pages":[],"recognized":{"circles":1,"arcs":4,"hatches":10,"linetypes":179,"merged":3},"scale":"asis","units":"mm","empty":null,"dxf_version":null,"page_size_mm":null,"layouts":null,"scanned":null,"missing":null,"ms_entities":null,"ms_drawable":null,"empty_reason":null,"warnings":[],"ms":319,"code":null,"message":null}
+{"version":"1.2.0","command":"dxf2pdf","pages":3,"entities":19,"layers":9,"text_entities":null,"images":null,"has_vectors":null,"text_as_outlines":null,"traced_pages":null,"recognized":null,"scale":null,"units":null,"empty":null,"dxf_version":"AC1024","page_size_mm":[297.0,210.0],"layouts":["Plan A3","Detail"],"scanned":true,"missing":{"xrefs":[],"underlays":[],"images":[],"aec":[]},"ms_entities":19,"ms_drawable":19,"empty_reason":null,"warnings":[],"ms":863,"code":null,"message":null}
 ```
 
 ## What the conversions do
@@ -173,6 +202,13 @@ background, colours kept (ACI 7 and true-colour white print black) or all black 
 `--colors mono`, relative lineweights, invisible layers and entities skipped; with
 `--layouts` the paper-space layouts follow as extra pages (pages merged with PyMuPDF). Damaged files go through `ezdxf.recover`; a file cut off at the end is
 closed after the last complete object first, so everything that was read is rendered.
+The recording is written to PDF by `cad_engine/pdf_backend.py` (1.2), a subclass of ezdxf's
+PyMuPDF backend with the same output (paths, colours, widths, one PDF layer per drawing
+layer) but linear time: the page content goes into a new content stream every 500 paths
+instead of one ever-growing string, the PDF layer of a drawing layer is looked up once,
+and line segments (hatch patterns) are written as `m` / `l` operators with 0.001 pt
+precision instead of one `Shape.draw_line` call each — drawings with tens of thousands of
+paths or millions of hatch segments render 4–7 times faster.
 
 ## Limits and environment
 
@@ -193,16 +229,21 @@ closed after the last complete object first, so everything that was read is rend
 .venv/bin/ruff check .
 ```
 
-Inputs are generated at session start (`tests/make_sample.py`) into pytest's temp dir.
+Inputs are generated at session start (`tests/make_sample.py`) into pytest's temp dir. `tests/test_pdf_backend.py` renders the same drawings with
+ezdxf's stock PyMuPDF backend and compares pages pixel by pixel, the PDF layers and the timing.
 Optional large samples (`floorplan.dxf`, `Ceco.NET-Architecture-Tm-53.dxf`) are read from
 `$CAD_ENGINE_SAMPLES_DIR`; tests that need them are skipped otherwise. Exit codes 3/4/5
 are also checked in-process (the `RLIMIT_AS` limit itself is not exercised by the tests).
 Raster-fallback tests that need OpenCV are skipped when it is not installed; the
 "OpenCV missing" path is tested in-process.
 
-Committed fixtures (`tests/fixtures/`): `sample_plan.dxf` (generated by
+Committed fixtures (`tests/fixtures/`): `sample_plan.dxf` and `underlay-only.dxf` (generated by
 `tests/make_sample.py`); `texts.dxf`, `dimensions.dxf`, `hatches.dxf` from the test suite
-of [bjnortier/dxf](https://github.com/bjnortier/dxf) (MIT). Every PDF the tests use
+of [bjnortier/dxf](https://github.com/bjnortier/dxf) (MIT); `AecObjects.dxf` — the sample
+`samples/aec_objects/AecObjects.dwg` of [ACadSharp](https://github.com/DomCR/ACadSharp) (MIT,
+Copyright (c) 2021 Albert Domenech, notice in `tests/fixtures/LICENSE-ACadSharp.txt`) converted to DXF by ACadSharp 3.4.9 (as the PDFConvert
+site does in the browser); `host_xref.dxf` — a generated DWG with one xref (`plan.dwg`),
+converted the same way. Every PDF the tests use
 (forms, scans, layered and rotated pages, circles/arcs, fills, dashed runs, duplicates,
 scale, scanned drawing, mixed vector + scan) and the DXF with paper-space layouts are
 generated at test time with PyMuPDF / ezdxf.

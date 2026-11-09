@@ -23,13 +23,15 @@ from typing import TYPE_CHECKING
 
 from cad_engine import outputs
 from cad_engine.budget import Budget, Ticker
-from cad_engine.dxfio import extents_mm_factor, load_dxf
+from cad_engine.dxfio import check_dxf_signature, extents_mm_factor, load_dxf
 from cad_engine.errors import EngineError, InputError
+from cad_engine.scan import EMPTY_MESSAGES, ScanResult, apply_to_meta, empty_reason, safe_scan
 
 if TYPE_CHECKING:
-    from ezdxf.addons.drawing.pymupdf import PyMuPdfBackend
     from ezdxf.document import Drawing
     from ezdxf.layouts import Layout
+
+    from cad_engine.pdf_backend import FastPdfBackend
 
 A4_MM = (297.0, 210.0)
 A3_MM = (420.0, 297.0)
@@ -48,19 +50,26 @@ def _white_to_black(entity, properties) -> None:  # ezdxf override signature
         properties.color = "#000000" + color[7:]
 
 
-def check_not_empty(doc: Drawing) -> tuple[float, float]:
-    """Return the model-space extents (w, h) in drawing units or raise empty_drawing."""
+def check_not_empty(doc: Drawing, scan: ScanResult | None = None) -> tuple[float, float]:
+    """Return the model-space extents (w, h) in drawing units, or raise when there is nothing to
+    draw — with the reason the content scan gives (``aec_objects`` > ``external_refs_only`` >
+    ``empty_drawing``, spec cad-missing-content). The scan's own «nothing drawable» (only
+    underlays, images or xref inserts) counts only when it saw the same model space as ezdxf."""
     from ezdxf import bbox
 
+    code = empty_reason(scan)
+    detail = EMPTY_MESSAGES[code]
     msp = doc.modelspace()
     if len(msp) == 0:
-        raise InputError("empty_drawing", "the drawing is empty (no entities in model space)")
+        raise InputError(code, f"{detail} (no entities in model space)")
+    if scan is not None and scan.nothing_to_draw and scan.ms_entities == len(msp):
+        raise InputError(code, f"{detail} (only external references in model space)")
     ext = bbox.extents(msp, fast=True)
     if not ext.has_data:
-        raise InputError("empty_drawing", "the drawing is empty (nothing to draw in model space)")
+        raise InputError(code, f"{detail} (nothing to draw in model space)")
     w, h = float(ext.size.x), float(ext.size.y)
     if w <= 0 and h <= 0:
-        raise InputError("empty_drawing", "the drawing is empty (zero-size extents)")
+        raise InputError(code, f"{detail} (zero-size extents)")
     return w, h
 
 
@@ -103,13 +112,15 @@ def _configuration(colors: str):
     )
 
 
-def render_layout(doc: Drawing, layout, budget: Budget, colors: str = "color") -> PyMuPdfBackend:
-    """Record one layout with the ezdxf frontend (budget checked every 200 entities)."""
+def render_layout(doc: Drawing, layout, budget: Budget, colors: str = "color") -> FastPdfBackend:
+    """Record one layout with the ezdxf frontend (budget checked every 200 entities); the
+    recording replays into the faster PDF output of `cad_engine.pdf_backend`."""
     from ezdxf.addons.drawing import Frontend, RenderContext
-    from ezdxf.addons.drawing.pymupdf import PyMuPdfBackend
+
+    from cad_engine.pdf_backend import FastPdfBackend
 
     ctx = RenderContext(doc)
-    backend = PyMuPdfBackend()
+    backend = FastPdfBackend()
     frontend = Frontend(ctx, backend, config=_configuration(colors))
     frontend.push_property_override_function(_white_to_black)
     ticker = Ticker(budget, every=200)
@@ -122,7 +133,7 @@ def render_layout(doc: Drawing, layout, budget: Budget, colors: str = "color") -
     return backend
 
 
-def render_modelspace(doc: Drawing, budget: Budget, colors: str = "color") -> PyMuPdfBackend:
+def render_modelspace(doc: Drawing, budget: Budget, colors: str = "color") -> FastPdfBackend:
     return render_layout(doc, doc.modelspace(), budget, colors)
 
 
@@ -195,6 +206,9 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
         raise ValueError(f"unknown page size {page!r}")
     if colors not in COLOR_CHOICES:
         raise ValueError(f"unknown colour mode {colors!r}")
+    check_dxf_signature(src)
+    scan = safe_scan(src, budget)
+    apply_to_meta(meta, scan)  # findings travel with a refusal too
     doc = load_dxf(src)
     msp = doc.modelspace()
     entities = len(msp)
@@ -202,7 +216,7 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
     meta["layers"] = len(doc.layers)
     meta["dxf_version"] = doc.dxfversion
     meta["layouts"] = []
-    w, h = check_not_empty(doc)
+    w, h = check_not_empty(doc, scan)
     budget.check()
 
     pw, ph = choose_page(page, w, h, entities, extents_mm_factor(doc))
