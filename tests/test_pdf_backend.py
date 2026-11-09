@@ -54,6 +54,11 @@ def heavy_20k(gen) -> Path:
 
 
 @pytest.fixture(scope="session")
+def text_heavy(gen) -> Path:
+    return make_sample.build_text_heavy_dxf(gen / "text_heavy.dxf", texts=2_000)
+
+
+@pytest.fixture(scope="session")
 def dense_hatches(gen) -> Path:
     return make_sample.build_heavy_dxf(gen / "dense_hatches.dxf", lines=0, hatches=300)
 
@@ -72,7 +77,7 @@ def layer_names(pdf: Path) -> list[str]:
         return sorted(info["name"] for info in doc.get_ocgs().values())
 
 
-@pytest.mark.parametrize("case", ["sample_plan", "layouts", "hatches", "texts", "dimensions"])
+@pytest.mark.parametrize("case", ["sample_plan", "layouts", "hatches", "texts", "dimensions", "text_heavy"])
 def test_same_picture_and_layers_as_stock(case, request, use_stock, tmp_path):
     src = {
         "sample_plan": lambda: request.getfixturevalue("sample_plan_dxf"),
@@ -80,6 +85,7 @@ def test_same_picture_and_layers_as_stock(case, request, use_stock, tmp_path):
         "hatches": lambda: FIXTURES / "hatches.dxf",
         "texts": lambda: FIXTURES / "texts.dxf",
         "dimensions": lambda: FIXTURES / "dimensions.dxf",
+        "text_heavy": lambda: request.getfixturevalue("text_heavy"),
     }[case]()
     layouts = case == "layouts"
     fast = render(src, tmp_path / "fast.pdf", layouts=layouts)
@@ -131,6 +137,14 @@ def test_faster_than_stock_on_dense_hatches(dense_hatches, use_stock, tmp_path):
     use_stock()
     stock = timed(dense_hatches, tmp_path / "stock.pdf")
     assert stock / fast >= 1.5, (stock, fast)  # measured 2.3x; pattern lines are ezdxf's own work too
+
+
+def test_faster_than_stock_on_text(text_heavy, use_stock, tmp_path):
+    # text is glyph outlines: curves written directly (1.2.1)
+    fast = timed(text_heavy, tmp_path / "fast.pdf")
+    use_stock()
+    stock = timed(text_heavy, tmp_path / "stock.pdf")
+    assert stock / fast >= 2.5, (stock, fast)  # measured 4.2x (33 s → 8 s on 4 000 TEXT)
 
 
 def test_time_grows_linearly(heavy_5k, heavy_20k, tmp_path):

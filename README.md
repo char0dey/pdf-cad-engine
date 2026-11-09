@@ -30,7 +30,7 @@ warning `raster_fallback_unavailable` in the meta instead of tracing (see below)
 python -I -m cad_engine <command> --in <file> [--out <file>] [--preview <png>]
                         [--meta <path>] [--budget-ms N] [--tmp <dir>]
                         [pdf2dxf options] [dxf2pdf options] [--light]
-python -I -m cad_engine --version          # prints "1.2.0"
+python -I -m cad_engine --version          # prints "1.2.1"
 cad-engine ...                             # console script, same arguments
 ```
 
@@ -141,7 +141,7 @@ All keys are always present; `null` when not applicable to the command.
 
 | Key | Type | Set by |
 |-----|------|--------|
-| `version` | string | all (`"1.2.0"`) |
+| `version` | string | all (`"1.2.1"`) |
 | `command` | string | all |
 | `pages` | int | `pdf2dxf`, `probe-pdf`, `dxf2pdf` (PDF pages written: 1 + layouts) |
 | `entities` | int | `pdf2dxf` (DXF entities written), `dxf2pdf` / `probe-dxf` / `preview-dxf` (model space) |
@@ -172,8 +172,8 @@ Examples (`pdf2dxf --arcs --hatch-fills --linetypes --merge --raster-fallback` o
 plan PDF; `dxf2pdf --layouts` on a plan with two paper-space layouts):
 
 ```json
-{"version":"1.2.0","command":"pdf2dxf","pages":1,"entities":1273,"layers":8,"text_entities":0,"images":0,"has_vectors":true,"text_as_outlines":true,"traced_pages":[],"recognized":{"circles":1,"arcs":4,"hatches":10,"linetypes":179,"merged":3},"scale":"asis","units":"mm","empty":null,"dxf_version":null,"page_size_mm":null,"layouts":null,"scanned":null,"missing":null,"ms_entities":null,"ms_drawable":null,"empty_reason":null,"warnings":[],"ms":319,"code":null,"message":null}
-{"version":"1.2.0","command":"dxf2pdf","pages":3,"entities":19,"layers":9,"text_entities":null,"images":null,"has_vectors":null,"text_as_outlines":null,"traced_pages":null,"recognized":null,"scale":null,"units":null,"empty":null,"dxf_version":"AC1024","page_size_mm":[297.0,210.0],"layouts":["Plan A3","Detail"],"scanned":true,"missing":{"xrefs":[],"underlays":[],"images":[],"aec":[]},"ms_entities":19,"ms_drawable":19,"empty_reason":null,"warnings":[],"ms":863,"code":null,"message":null}
+{"version":"1.2.1","command":"pdf2dxf","pages":1,"entities":1273,"layers":8,"text_entities":0,"images":0,"has_vectors":true,"text_as_outlines":true,"traced_pages":[],"recognized":{"circles":1,"arcs":4,"hatches":10,"linetypes":179,"merged":3},"scale":"asis","units":"mm","empty":null,"dxf_version":null,"page_size_mm":null,"layouts":null,"scanned":null,"missing":null,"ms_entities":null,"ms_drawable":null,"empty_reason":null,"warnings":[],"ms":319,"code":null,"message":null}
+{"version":"1.2.1","command":"dxf2pdf","pages":3,"entities":19,"layers":9,"text_entities":null,"images":null,"has_vectors":null,"text_as_outlines":null,"traced_pages":null,"recognized":null,"scale":null,"units":null,"empty":null,"dxf_version":"AC1024","page_size_mm":[297.0,210.0],"layouts":["Plan A3","Detail"],"scanned":true,"missing":{"xrefs":[],"underlays":[],"images":[],"aec":[]},"ms_entities":19,"ms_drawable":19,"empty_reason":null,"warnings":[],"ms":863,"code":null,"message":null}
 ```
 
 ## What the conversions do

@@ -262,6 +262,30 @@ def build_heavy_dxf(out: Path, *, lines: int = 20_000, hatches: int = 0, hatch_s
     return out
 
 
+def build_text_heavy_dxf(out: Path, *, texts: int = 2_000) -> Path:
+    """Many TEXT entities plus a few lines and circles: text is drawn as glyph outlines, i.e.
+    curves — the stress case of the 40 MB TEST run on 2026-11-09 (engine 1.2.1)."""
+    import random
+
+    import ezdxf
+
+    doc = ezdxf.new("R2010")
+    msp = doc.modelspace()
+    rnd = random.Random(3)
+
+    def spot() -> tuple[float, float]:
+        return rnd.uniform(0, 30000), rnd.uniform(0, 30000)
+
+    for i in range(texts):
+        msp.add_text(f"Room {i} 12.5 m²", height=200).set_placement(spot())
+        if i % 4 == 0:
+            msp.add_line(spot(), spot())
+    for _ in range(100):
+        msp.add_circle((rnd.uniform(0, 30000), rnd.uniform(0, 30000)), 300)
+    doc.saveas(out)
+    return out
+
+
 def truncate_file(src: Path, out: Path, ratio: float) -> Path:
     data = src.read_bytes()
     out.write_bytes(data[: int(len(data) * ratio)])
