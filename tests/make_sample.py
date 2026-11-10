@@ -608,3 +608,110 @@ if __name__ == "__main__":
     target = Path(sys.argv[1] if len(sys.argv) > 1 else "sample_plan.dxf")
     build_sample_plan(target)
     print(target)
+
+
+def _raw_pdf(out: Path, objects: list[bytes]) -> Path:
+    """A PDF from raw object bodies (object 1 = catalog …); stdlib only, so a million paths stay cheap."""
+    data = bytearray(b"%PDF-1.7\n")
+    offsets = []
+    for i, body in enumerate(objects, 1):
+        offsets.append(len(data))
+        data += b"%d 0 obj\n" % i + body + b"\nendobj\n"
+    xref = len(data)
+    data += b"xref\n0 %d\n0000000000 65535 f \n" % (len(objects) + 1)
+    data += b"".join(b"%010d 00000 n \n" % o for o in offsets)
+    data += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (len(objects) + 1, xref)
+    out.write_bytes(bytes(data))
+    return out
+
+
+def _stream(content: bytes, extra: bytes = b"") -> bytes:
+    import zlib
+
+    packed = zlib.compress(content, 6)
+    return b"<< /Length %d /Filter /FlateDecode %s>>\nstream\n" % (len(packed), extra) + packed + b"\nendstream"
+
+
+def _lines(n: int, seed: int = 7) -> bytes:
+    import random
+
+    rnd = random.Random(seed)
+    parts = [b"0.1 w\n"]
+    for _ in range(n):
+        x, y = rnd.uniform(0, 1190), rnd.uniform(0, 842)
+        parts.append(b"%.1f %.1f m %.1f %.1f l S\n" % (x, y, x + 3, y + 2))
+    return b"".join(parts)
+
+
+def build_dense_lines_pdf(out: Path, lines: int, *, form_calls: int = 0, noise: bytes = b"") -> Path:
+    """One A3 page with ``lines`` separate one-segment paths (PROD 2026-11-10 pattern). With
+    ``form_calls`` the lines live in a Form XObject drawn that many times; ``noise`` is prepended
+    to the page content (strings, inline images … that must not count as paths)."""
+    page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1190 842] /Contents 4 0 R%s >>"
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>"]
+    if form_calls:
+        objects.append(page % b" /Resources << /XObject << /F0 5 0 R >> >>")
+        objects.append(_stream(noise + b"q /F0 Do Q\n" * form_calls))
+        objects.append(_stream(_lines(lines), b"/Type /XObject /Subtype /Form /BBox [0 0 1190 842] "))
+    else:
+        objects.append(page % b"")
+        objects.append(_stream(noise + _lines(lines)))
+    return _raw_pdf(out, objects)
+
+
+def build_dense_hatch_dxf(out: Path, *, pattern: str = "AR-CONC", scale: float = 0.005, width: float = 8000.0,
+                          height: float = 2000.0, inserts: int = 0, paper: bool = False, lines: int = 300) -> Path:
+    """The Civil 3D plan of PROD 2026-11-10, generated: metres, ``lines`` ordinary lines and one
+    hatch ``pattern`` at ``scale`` over ``width`` × ``height`` — in model space, in a block inserted
+    ``inserts`` times, or (``paper``) on a paper-space layout. ``pattern="SOLID"`` gives a fill."""
+    import random
+
+    import ezdxf
+
+    doc = ezdxf.new("R2010", units=6)
+    msp = doc.modelspace()
+    rnd = random.Random(7)
+    for _ in range(lines):
+        x, y = rnd.uniform(0, width), rnd.uniform(0, height)
+        msp.add_line((x, y), (x + rnd.uniform(-50, 50), y + rnd.uniform(-50, 50)))
+
+    def add_hatch(space, w: float, h: float, origin=(0.0, 0.0)) -> None:
+        hatch = space.add_hatch(color=3)
+        if pattern == "SOLID":
+            hatch.set_solid_fill(color=3)
+        else:
+            hatch.set_pattern_fill(pattern, scale=scale)
+        x, y = origin
+        hatch.paths.add_polyline_path([(x, y), (x + w, y), (x + w, y + h), (x, y + h)], is_closed=True)
+
+    if paper:
+        sheet = doc.layouts.new("Sheet1")
+        sheet.add_line((0, 0), (400, 0))
+        add_hatch(sheet, 300.0, 200.0, (10.0, 10.0))
+    elif inserts:
+        block = doc.blocks.new("SITE")
+        add_hatch(block, width, height)
+        for i in range(inserts):
+            msp.add_blockref("SITE", (i * (width + 100), 0))
+    else:
+        add_hatch(msp, width, height)
+    doc.saveas(out)
+    return out
+
+
+def build_blank_model_dxf(out: Path, *, with_layout: bool) -> Path:
+    """Model space whose every entity is on a layer that is off (the R14 converter bug of
+    PROD 2026-11-10, or a drawing saved that way); optionally a sheet with a frame and a title."""
+    import ezdxf
+
+    doc = ezdxf.new("R2010")
+    doc.layers.add("HIDDEN", color=1).off()
+    msp = doc.modelspace()
+    for i in range(50):
+        msp.add_line((i * 10, 0), (i * 10, 100), dxfattribs={"layer": "HIDDEN"})
+    if with_layout:
+        sheet = doc.layouts.new("Sheet1")
+        sheet.add_lwpolyline([(0, 0), (400, 0), (400, 280), (0, 280)], close=True)
+        sheet.add_text("TITLE", height=5).set_placement((300, 10))
+    doc.saveas(out)
+    return out

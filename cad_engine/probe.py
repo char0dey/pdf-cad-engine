@@ -3,7 +3,8 @@
 """Fast input analysis (probe-pdf, probe-dxf) and the DXF preview (preview-dxf).
 
 Probes report facts and exit 0; they exit 2 only when the input cannot be
-identified or read (``unsupported_input``, ``dwg_not_dxf``). An empty drawing is a fact
+identified or read (``unsupported_input``, ``dwg_not_dxf``) or, for a PDF, when a page is too
+heavy to read at all (``too_complex``, `cad_engine.complexity`). An empty drawing is a fact
 (``empty`` + ``empty_reason``), not an exit 2.
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 from cad_engine import outputs
 from cad_engine.budget import Budget
+from cad_engine.complexity import check_pdf_complexity
 from cad_engine.dxf2pdf import check_not_empty, paper_layouts, render_modelspace
 from cad_engine.dxfio import check_dxf_signature, load_dxf
 from cad_engine.errors import EngineError, InputError
@@ -27,6 +29,8 @@ PREVIEW_MIN_SHORT_SIDE_MM = 40.0
 def probe_pdf(src: str, *, budget: Budget, meta: dict) -> None:
     pdf = open_pdf(src)
     meta["pages"] = pdf.page_count
+    # before any get_drawings(): past the memory limit it crashes instead of raising
+    check_pdf_complexity(pdf, budget=budget)
     flags = text_flags()
     has_drawings = False
     texts = 0

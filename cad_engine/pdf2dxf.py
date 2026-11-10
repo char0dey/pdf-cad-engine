@@ -780,6 +780,10 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, preview_path: str
     meta["pages"] = pages
     if pages > max_pages:
         raise InputError("too_many_pages", f"the PDF has {pages} pages; the limit is {max_pages} pages")
+    # every page before the first get_drawings(): inputs stored before engine 1.3 were not checked
+    from cad_engine.complexity import check_pdf_complexity
+
+    check_pdf_complexity(pdf, budget=budget)
 
     has_ocg, layers_off = _ocg_state(pdf)
     writer = DxfWriter(budget, max_entities=max_entities, record_preview=preview_path is not None,

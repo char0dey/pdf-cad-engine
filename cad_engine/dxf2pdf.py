@@ -114,14 +114,17 @@ def _configuration(colors: str):
 
 def render_layout(doc: Drawing, layout, budget: Budget, colors: str = "color") -> FastPdfBackend:
     """Record one layout with the ezdxf frontend (budget checked every 200 entities); the
-    recording replays into the faster PDF output of `cad_engine.pdf_backend`."""
-    from ezdxf.addons.drawing import Frontend, RenderContext
+    recording replays into the faster PDF output of `cad_engine.pdf_backend`. Hatch patterns
+    are capped (`cad_engine.hatch_limit`); ``backend.simplified_hatches`` says how many hatches
+    of this layout were drawn as outlines."""
+    from ezdxf.addons.drawing import RenderContext
 
+    from cad_engine.hatch_limit import EngineFrontend
     from cad_engine.pdf_backend import FastPdfBackend
 
     ctx = RenderContext(doc)
     backend = FastPdfBackend()
-    frontend = Frontend(ctx, backend, config=_configuration(colors))
+    frontend = EngineFrontend(ctx, backend, config=_configuration(colors), tick=budget.check)
     frontend.push_property_override_function(_white_to_black)
     ticker = Ticker(budget, every=200)
 
@@ -130,6 +133,7 @@ def render_layout(doc: Drawing, layout, budget: Budget, colors: str = "color") -
         return True
 
     frontend.draw_layout(layout, finalize=True, filter_func=keep)
+    backend.simplified_hatches = frontend.simplified_hatches
     return backend
 
 
@@ -160,7 +164,7 @@ def _blank_page(width_mm: float, height_mm: float) -> bytes:
         return doc.tobytes()
 
 
-def _layout_pdf(doc: Drawing, name: str, budget: Budget, colors: str) -> tuple[bytes, tuple[float, float]]:
+def _layout_pdf(doc: Drawing, name: str, budget: Budget, colors: str) -> tuple[bytes, tuple[float, float], int]:
     """One paper-space layout as a one-page PDF in its paper size. A layout whose viewports
     look at an empty part of model space draws nothing: it becomes a blank sheet, as a CAD
     program would plot it."""
@@ -173,6 +177,7 @@ def _layout_pdf(doc: Drawing, name: str, budget: Budget, colors: str) -> tuple[b
     else:
         page = page_layout.Page(*A4_MM, page_layout.Units.mm, margins=page_layout.Margins.all(MARGIN_MM))
     backend = render_layout(doc, paper, budget, colors)
+    hatches = backend.simplified_hatches
     budget.check()
     # paper space is drawn in paper units: keep 1:1 when the content fits the printable area,
     # otherwise (inch-based or oversized layouts) fit it to the page
@@ -192,10 +197,10 @@ def _layout_pdf(doc: Drawing, name: str, budget: Budget, colors: str) -> tuple[b
         if "empty bounding box" not in str(exc):
             raise
         print(f"cad-engine: layout {name!r} draws nothing; blank sheet", file=sys.stderr)
-        return _blank_page(*size), size
+        return _blank_page(*size), size, hatches
     if not data:
         raise EngineError(f"the PDF backend returned no data for layout {name!r}")
-    return data, size
+    return data, size, hatches
 
 
 def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto", colors: str = "color",
@@ -221,38 +226,57 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
 
     pw, ph = choose_page(page, w, h, entities, extents_mm_factor(doc))
     backend = render_modelspace(doc, budget, colors)
+    simplified = backend.simplified_hatches
     budget.check()
     model_page = layout.Page(pw, ph, layout.Units.mm, margins=layout.Margins.all(MARGIN_MM))
-    pdf_bytes = backend.get_pdf_bytes(model_page, settings=layout.Settings(fit_page=True))
-    if not pdf_bytes:
+    names = paper_layouts(doc) if layouts else []
+    try:
+        pdf_bytes: bytes | None = backend.get_pdf_bytes(model_page, settings=layout.Settings(fit_page=True))
+    except ValueError as exc:
+        if "empty bounding box" not in str(exc):
+            raise
+        # entities, but none visible (all on layers that are off or frozen …): the sheets, or a refusal
+        code = empty_reason(scan)
+        if not names:
+            raise InputError(code, f"{EMPTY_MESSAGES[code]} (nothing visible in model space)") from exc
+        print("cad-engine: model space draws nothing visible; the PDF holds the layouts only", file=sys.stderr)
+        meta["model_blank"] = True
+        pdf_bytes = None
+    if pdf_bytes is not None and not pdf_bytes:
         raise EngineError("the PDF backend returned no data")
     rendered: list[tuple[str, tuple[float, float]]] = []
-    if layouts:
-        names = paper_layouts(doc)
-        if names:
-            import pymupdf
+    if names:
+        import pymupdf
 
-            merged = pymupdf.open("pdf", pdf_bytes)  # Model space first, keeps its optional content
-            for name in names:
-                budget.check()
-                try:
-                    data, size = _layout_pdf(doc, name, budget, colors)
-                except MemoryError:
-                    raise
-                except Exception as exc:  # one broken layout must not cost the model-space page
-                    print(f"cad-engine: layout {name!r} skipped ({type(exc).__name__}: {exc})",
-                          file=sys.stderr)
-                    meta.setdefault("warnings", []).append(f"layout_skipped:{name}")
-                    continue
-                with pymupdf.open("pdf", data) as part:
-                    merged.insert_pdf(part)
-                rendered.append((name, size))
+        # Model space first, keeps its optional content; a blank model leaves only the sheets
+        merged = pymupdf.open("pdf", pdf_bytes) if pdf_bytes is not None else pymupdf.open()
+        for name in names:
             budget.check()
-            pdf_bytes = merged.tobytes(garbage=1, deflate=True)
+            try:
+                data, size, hatches = _layout_pdf(doc, name, budget, colors)
+            except MemoryError:
+                raise
+            except Exception as exc:  # one broken layout must not cost the model-space page
+                print(f"cad-engine: layout {name!r} skipped ({type(exc).__name__}: {exc})",
+                      file=sys.stderr)
+                meta.setdefault("warnings", []).append(f"layout_skipped:{name}")
+                continue
+            with pymupdf.open("pdf", data) as part:
+                merged.insert_pdf(part)
+            rendered.append((name, size))
+            simplified += hatches
+        budget.check()
+        if merged.page_count == 0:  # a blank model and every layout skipped
             merged.close()
-    meta["pages"] = 1 + len(rendered)
-    meta["page_size_mm"] = [pw, ph]
+            code = empty_reason(scan)
+            raise InputError(code, f"{EMPTY_MESSAGES[code]} (nothing visible in model space, no layout rendered)")
+        pdf_bytes = merged.tobytes(garbage=1, deflate=True)
+        merged.close()
+    model_pages = 0 if meta.get("model_blank") else 1
+    meta["pages"] = model_pages + len(rendered)
+    meta["page_size_mm"] = [pw, ph] if model_pages else list(rendered[0][1])
     meta["layouts"] = [name for name, _ in rendered]
+    meta["simplified_hatches"] = simplified
     budget.check()
     outputs.write_part(dst, pdf_bytes)
     outputs.commit(dst)

@@ -116,6 +116,8 @@ def new_meta() -> dict:
         "ms_entities": None,
         "ms_drawable": None,
         "empty_reason": None,
+        "simplified_hatches": None,
+        "model_blank": None,
         "warnings": [],
         "ms": None,
         "code": None,

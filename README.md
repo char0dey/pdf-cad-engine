@@ -30,7 +30,7 @@ warning `raster_fallback_unavailable` in the meta instead of tracing (see below)
 python -I -m cad_engine <command> --in <file> [--out <file>] [--preview <png>]
                         [--meta <path>] [--budget-ms N] [--tmp <dir>]
                         [pdf2dxf options] [dxf2pdf options] [--light]
-python -I -m cad_engine --version          # prints "1.2.1"
+python -I -m cad_engine --version          # prints "1.3.0"
 cad-engine ...                             # console script, same arguments
 ```
 
@@ -101,17 +101,21 @@ Input error codes:
 - `no_vectors` — `pdf2dxf`: no vector paths and no visible text on any page (scans; invisible
   OCR text does not count).
 - `too_many_pages` — `pdf2dxf`: more than 50 pages (checked before converting).
-- `too_complex` — `pdf2dxf`: more than 500 000 DXF entities.
+- `too_complex` — `pdf2dxf`: more than 500 000 DXF entities; `pdf2dxf` and `probe-pdf` (1.3): a page
+  whose paths would take more than ~1.2 GB in PyMuPDF's `get_drawings()` (estimated from the
+  operators in its content streams and forms, before reading the paths — `cad_engine/complexity.py`).
 - `dwg_not_dxf` — the file starts with a DWG signature (`AC10xx`), checked before parsing.
 - `aec_objects`, `external_refs_only`, `empty_drawing` (1.2) — `dxf2pdf`: nothing to draw in model
-  space (no entities, no extents, or only underlays / images / xref inserts), with the reason by
+  space (no entities, no extents, only underlays / images / xref inserts, or — 1.3 — entities of which
+  none is visible and no paper-space layout to print instead), with the reason by
   priority: `aec_objects` when the content scan found AutoCAD Architecture / MEP / Civil 3D entity
   classes (their objects are not in the DXF), else `external_refs_only` when it found xrefs,
   underlays or images, else `empty_drawing`. `preview-dxf` refuses an empty drawing with
   `empty_drawing` only. The meta of the refusal carries the scan (`missing`).
 - `unsupported_input` — not a PDF / not a DXF / password-protected PDF / unrecoverable DXF.
 
-Probes report facts and exit 0; they exit 2 only for `unsupported_input` and `dwg_not_dxf`
+Probes report facts and exit 0; they exit 2 only for `unsupported_input`, `dwg_not_dxf` and (1.3,
+`probe-pdf`) `too_complex`
 (`probe-pdf` reports `pages` and leaves the 50-page limit to the caller; `probe-dxf`
 reports `empty: true` and `empty_reason` — the code `dxf2pdf` would refuse with — instead of failing).
 
@@ -141,7 +145,7 @@ All keys are always present; `null` when not applicable to the command.
 
 | Key | Type | Set by |
 |-----|------|--------|
-| `version` | string | all (`"1.2.1"`) |
+| `version` | string | all (`"1.3.0"`) |
 | `command` | string | all |
 | `pages` | int | `pdf2dxf`, `probe-pdf`, `dxf2pdf` (PDF pages written: 1 + layouts) |
 | `entities` | int | `pdf2dxf` (DXF entities written), `dxf2pdf` / `probe-dxf` / `preview-dxf` (model space) |
@@ -162,6 +166,8 @@ All keys are always present; `null` when not applicable to the command.
 | `dxf_version` | string | DXF commands, e.g. `"AC1024"` |
 | `page_size_mm` | [w, h] | `dxf2pdf` — model-space page, e.g. `[297.0, 210.0]` |
 | `layouts` | string[] | `dxf2pdf` — paper-space layouts rendered as extra pages (`[]` without `--layouts`); `probe-dxf` — paper-space layouts with content |
+| `simplified_hatches` | int | `dxf2pdf` (1.3) — hatches drawn as their outline because the pattern would produce more than 1 000 000 line segments (model space and rendered layouts, each insert counted) |
+| `model_blank` | bool | `dxf2pdf` (1.3) — `true` when model space has entities but none visible and the PDF holds only the paper-space layouts (`page_size_mm` is then the first layout's) |
 | `warnings` | string[] | all — `[]` or e.g. `"raster_fallback_unavailable"`, `"layout_skipped:<name>"` |
 | `ms` | int | all — wall time since start |
 | `code`, `message` | string | on failure (exit ≠ 0) |
@@ -172,8 +178,8 @@ Examples (`pdf2dxf --arcs --hatch-fills --linetypes --merge --raster-fallback` o
 plan PDF; `dxf2pdf --layouts` on a plan with two paper-space layouts):
 
 ```json
-{"version":"1.2.1","command":"pdf2dxf","pages":1,"entities":1273,"layers":8,"text_entities":0,"images":0,"has_vectors":true,"text_as_outlines":true,"traced_pages":[],"recognized":{"circles":1,"arcs":4,"hatches":10,"linetypes":179,"merged":3},"scale":"asis","units":"mm","empty":null,"dxf_version":null,"page_size_mm":null,"layouts":null,"scanned":null,"missing":null,"ms_entities":null,"ms_drawable":null,"empty_reason":null,"warnings":[],"ms":319,"code":null,"message":null}
-{"version":"1.2.1","command":"dxf2pdf","pages":3,"entities":19,"layers":9,"text_entities":null,"images":null,"has_vectors":null,"text_as_outlines":null,"traced_pages":null,"recognized":null,"scale":null,"units":null,"empty":null,"dxf_version":"AC1024","page_size_mm":[297.0,210.0],"layouts":["Plan A3","Detail"],"scanned":true,"missing":{"xrefs":[],"underlays":[],"images":[],"aec":[]},"ms_entities":19,"ms_drawable":19,"empty_reason":null,"warnings":[],"ms":863,"code":null,"message":null}
+{"version":"1.3.0","command":"pdf2dxf","pages":1,"entities":1273,"layers":8,"text_entities":0,"images":0,"has_vectors":true,"text_as_outlines":true,"traced_pages":[],"recognized":{"circles":1,"arcs":4,"hatches":10,"linetypes":179,"merged":3},"scale":"asis","units":"mm","empty":null,"dxf_version":null,"page_size_mm":null,"layouts":null,"scanned":null,"missing":null,"ms_entities":null,"ms_drawable":null,"empty_reason":null,"warnings":[],"ms":319,"code":null,"message":null}
+{"version":"1.3.0","command":"dxf2pdf","pages":3,"entities":19,"layers":9,"text_entities":null,"images":null,"has_vectors":null,"text_as_outlines":null,"traced_pages":null,"recognized":null,"scale":null,"units":null,"empty":null,"dxf_version":"AC1024","page_size_mm":[297.0,210.0],"layouts":["Plan A3","Detail"],"scanned":true,"missing":{"xrefs":[],"underlays":[],"images":[],"aec":[]},"ms_entities":19,"ms_drawable":19,"empty_reason":null,"warnings":[],"ms":863,"code":null,"message":null}
 ```
 
 ## What the conversions do
@@ -213,6 +219,10 @@ paths or millions of hatch segments render 4–7 times faster.
 ## Limits and environment
 
 - 50 PDF pages, 500 000 DXF entities, default budget 90 s.
+- A PDF page is refused (`too_complex`) when its paths would take more than ~1.2 GB in
+  `get_drawings()` (~1.25 KB per path + 0.37 KB per segment, measured with PyMuPDF 1.26.7).
+- A hatch pattern that would produce more than 1 000 000 line segments is drawn as the hatch's
+  outline (`simplified_hatches`); AutoCAD's HPMAXLINES has the same number but counts pattern lines.
 - Address space limited to 2 GB (`RLIMIT_AS`, Linux; macOS ignores it). Override with
   `CAD_ENGINE_MEMORY_MB` (0 disables).
 - BLAS/OpenMP thread pools are limited to one thread (OpenCV too: `cv2.setNumThreads(1)`).
