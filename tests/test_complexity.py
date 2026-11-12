@@ -7,11 +7,12 @@ from __future__ import annotations
 import time
 
 import pytest
-from conftest import run_engine
 
-import make_sample
 from cad_engine.complexity import MAX_PAGE_BYTES, check_pdf_complexity, page_cost
 from cad_engine.errors import InputError
+
+import make_sample
+from conftest import run_engine
 
 
 def _cost(path):
@@ -46,7 +47,8 @@ def test_strings_comments_and_inline_images_are_not_operators(gen):
         b"0 0 100 100 re f\n"
     )
     cost = _cost(make_sample.build_dense_lines_pdf(gen / "noise.pdf", 3, noise=noise))
-    assert (cost.paths, cost.segments) == (3 + 1, 3 + 1 + 1)  # + the filled rectangle; `l` of the clip counts as a segment
+    # + the filled rectangle; `l` of the clip counts as a segment
+    assert (cost.paths, cost.segments) == (3 + 1, 3 + 1 + 1)
 
 
 def test_ordinary_pdfs_pass(sample_plan_pdf, antrag_pdf):

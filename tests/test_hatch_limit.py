@@ -10,13 +10,14 @@ from pathlib import Path
 import numpy as np
 import pymupdf
 import pytest
-from conftest import FIXTURES, run_engine
 
-import make_sample
 from cad_engine import hatch_limit
 from cad_engine.budget import Budget
 from cad_engine.dxf2pdf import convert
 from cad_engine.errors import InputError
+
+import make_sample
+from conftest import FIXTURES, run_engine
 
 
 def render(src: Path, out: Path, **kwargs) -> dict:

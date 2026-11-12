@@ -13,7 +13,7 @@ from __future__ import annotations
 from cad_engine import outputs
 from cad_engine.budget import Budget
 from cad_engine.complexity import check_pdf_complexity
-from cad_engine.dxf2pdf import check_not_empty, paper_layouts, render_modelspace
+from cad_engine.dxf2pdf import check_not_empty, paper_layouts, render_modelspace, sheet_layouts
 from cad_engine.dxfio import check_dxf_signature, load_dxf
 from cad_engine.errors import EngineError, InputError
 from cad_engine.pdf2dxf import clean_text, open_pdf, text_flags, visible
@@ -63,6 +63,9 @@ def probe_dxf(src: str, *, budget: Budget, meta: dict, light: bool = False) -> N
     """Facts about a DXF: the content scan (`cad_engine.scan`) and, unless ``light``, the
     loaded document (entities, layers, layouts, extents). ``empty`` is true when there is
     nothing to draw, ``empty_reason`` then says why (the code `dxf2pdf` would refuse with).
+    The answer is the one for ``dxf2pdf --layouts`` (the service always passes it): an empty
+    model space with sheets that draw something is not empty, ``layouts`` then lists those
+    sheets — the pages of the PDF (1.4).
     ``light`` (big files) skips loading: ``entities`` / ``empty`` come from the scan alone and
     stay null when the scan failed or the file is cut off."""
     check_dxf_signature(src)
@@ -84,11 +87,14 @@ def probe_dxf(src: str, *, budget: Budget, meta: dict, light: bool = False) -> N
     meta["dxf_version"] = doc.dxfversion
     meta["layouts"] = paper_layouts(doc)
     try:
-        check_not_empty(doc, scan)
-        meta["empty"] = False
+        extents = check_not_empty(doc, scan, sheets=True)
     except InputError as exc:
         meta["empty"] = True
         meta["empty_reason"] = exc.code
+        return
+    meta["empty"] = False
+    if extents is None:  # empty model space: the PDF is the sheets that draw something
+        meta["layouts"] = sheet_layouts(doc)
 
 
 def _preview_page(w: float, h: float):

@@ -13,7 +13,8 @@ drawing size; invisible layers and entities are skipped by the ezdxf frontend.
 viewports that show model space), in tab order after Model space, each in its own paper
 size (A4 landscape when the layout has none); viewports show model space through their
 clipping window. A layout whose viewports show an empty part of model space comes out as a
-blank sheet (as a CAD program would plot it).
+blank sheet (as a CAD program would plot it). When model space has nothing to draw at all
+(1.4) but sheets have entities of their own, the PDF holds those sheets only (``model_blank``).
 """
 
 from __future__ import annotations
@@ -50,11 +51,25 @@ def _white_to_black(entity, properties) -> None:  # ezdxf override signature
         properties.color = "#000000" + color[7:]
 
 
-def check_not_empty(doc: Drawing, scan: ScanResult | None = None) -> tuple[float, float]:
+def check_not_empty(doc: Drawing, scan: ScanResult | None = None, *,
+                    sheets: bool = False) -> tuple[float, float] | None:
     """Return the model-space extents (w, h) in drawing units, or raise when there is nothing to
     draw — with the reason the content scan gives (``aec_objects`` > ``external_refs_only`` >
     ``empty_drawing``, spec cad-missing-content). The scan's own «nothing drawable» (only
-    underlays, images or xref inserts) counts only when it saw the same model space as ezdxf."""
+    underlays, images or xref inserts) counts only when it saw the same model space as ezdxf.
+
+    With ``sheets`` (the PDF gets the paper-space layouts, ``--layouts``), an empty model space
+    is not a refusal when some layout draws something of its own (`sheet_layouts`): the result
+    is then None and the PDF holds the sheets only (1.4)."""
+    try:
+        return _model_extents(doc, scan)
+    except InputError:
+        if sheets and sheet_layouts(doc):
+            return None
+        raise
+
+
+def _model_extents(doc: Drawing, scan: ScanResult | None) -> tuple[float, float]:
     from ezdxf import bbox
 
     code = empty_reason(scan)
@@ -62,7 +77,7 @@ def check_not_empty(doc: Drawing, scan: ScanResult | None = None) -> tuple[float
     msp = doc.modelspace()
     if len(msp) == 0:
         raise InputError(code, f"{detail} (no entities in model space)")
-    if scan is not None and scan.nothing_to_draw and scan.ms_entities == len(msp):
+    if scan is not None and scan.model_nothing_to_draw and scan.ms_entities == len(msp):
         raise InputError(code, f"{detail} (only external references in model space)")
     ext = bbox.extents(msp, fast=True)
     if not ext.has_data:
@@ -89,17 +104,33 @@ def layout_content(layout: Layout) -> list:
     return [e for e in layout if e.dxftype() != "VIEWPORT"] + drawn_viewports(layout)
 
 
-def paper_layouts(doc: Drawing) -> list[str]:
-    """Names of the paper-space layouts (tab order) with content: paper-space entities or
-    viewports that show model space (see `drawn_viewports`)."""
-    names = []
+def _paper_spaces(doc: Drawing):
+    """``(name, layout)`` of the paper-space layouts in tab order."""
     for name in doc.layouts.names_in_taborder():
         if name.lower() == "model":
             continue
         layout = doc.layouts.get(name)
-        if layout is not None and layout_content(layout):
-            names.append(name)
-    return names
+        if layout is not None:
+            yield name, layout
+
+
+def paper_layouts(doc: Drawing) -> list[str]:
+    """Names of the paper-space layouts (tab order) with content: paper-space entities or
+    viewports that show model space (see `drawn_viewports`)."""
+    return [name for name, layout in _paper_spaces(doc) if layout_content(layout)]
+
+
+def sheet_layouts(doc: Drawing) -> list[str]:
+    """Names of the paper-space layouts (tab order) that draw something of their own: an entity
+    other than a viewport, with extents. With an empty model space the viewports show nothing, so
+    these are the pages of a sheets-only PDF; a layout with viewports alone would be a blank
+    sheet and does not count (1.4)."""
+    from ezdxf import bbox
+
+    def draws(layout: Layout) -> bool:  # stops at the first entity with extents
+        return any(e.dxftype() != "VIEWPORT" and bbox.extents((e,), fast=True).has_data for e in layout)
+
+    return [name for name, layout in _paper_spaces(doc) if draws(layout)]
 
 
 def _configuration(colors: str):
@@ -164,7 +195,8 @@ def _blank_page(width_mm: float, height_mm: float) -> bytes:
         return doc.tobytes()
 
 
-def _layout_pdf(doc: Drawing, name: str, budget: Budget, colors: str) -> tuple[bytes, tuple[float, float], int]:
+def _layout_pdf(doc: Drawing, name: str, budget: Budget,
+                colors: str) -> tuple[bytes, tuple[float, float], int]:
     """One paper-space layout as a one-page PDF in its paper size. A layout whose viewports
     look at an empty part of model space draws nothing: it becomes a blank sheet, as a CAD
     program would plot it."""
@@ -203,10 +235,28 @@ def _layout_pdf(doc: Drawing, name: str, budget: Budget, colors: str) -> tuple[b
     return data, size, hatches
 
 
-def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto", colors: str = "color",
-            layouts: bool = False) -> None:
+def _model_pdf(doc: Drawing, size_mm: tuple[float, float], budget: Budget,
+               colors: str) -> tuple[bytes | None, int]:
+    """Model space as a one-page PDF and the number of simplified hatches; None instead of the
+    PDF when nothing in model space is visible (all on layers that are off or frozen …)."""
     from ezdxf.addons.drawing import layout
 
+    backend = render_modelspace(doc, budget, colors)
+    budget.check()
+    model_page = layout.Page(*size_mm, layout.Units.mm, margins=layout.Margins.all(MARGIN_MM))
+    try:
+        data = backend.get_pdf_bytes(model_page, settings=layout.Settings(fit_page=True))
+    except ValueError as exc:
+        if "empty bounding box" not in str(exc):
+            raise
+        return None, backend.simplified_hatches
+    if not data:
+        raise EngineError("the PDF backend returned no data")
+    return data, backend.simplified_hatches
+
+
+def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto", colors: str = "color",
+            layouts: bool = False) -> None:
     if page not in PAGE_CHOICES:
         raise ValueError(f"unknown page size {page!r}")
     if colors not in COLOR_CHOICES:
@@ -221,29 +271,29 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
     meta["layers"] = len(doc.layers)
     meta["dxf_version"] = doc.dxfversion
     meta["layouts"] = []
-    w, h = check_not_empty(doc, scan)
+    extents = check_not_empty(doc, scan, sheets=layouts)
     budget.check()
 
-    pw, ph = choose_page(page, w, h, entities, extents_mm_factor(doc))
-    backend = render_modelspace(doc, budget, colors)
-    simplified = backend.simplified_hatches
-    budget.check()
-    model_page = layout.Page(pw, ph, layout.Units.mm, margins=layout.Margins.all(MARGIN_MM))
-    names = paper_layouts(doc) if layouts else []
-    try:
-        pdf_bytes: bytes | None = backend.get_pdf_bytes(model_page, settings=layout.Settings(fit_page=True))
-    except ValueError as exc:
-        if "empty bounding box" not in str(exc):
-            raise
-        # entities, but none visible (all on layers that are off or frozen …): the sheets, or a refusal
-        code = empty_reason(scan)
-        if not names:
-            raise InputError(code, f"{EMPTY_MESSAGES[code]} (nothing visible in model space)") from exc
-        print("cad-engine: model space draws nothing visible; the PDF holds the layouts only", file=sys.stderr)
+    if extents is None:
+        # 1.4: model space has nothing to draw, the sheets have: no model page, the sheets only
+        print("cad-engine: model space is empty; the PDF holds the layouts only", file=sys.stderr)
+        w = h = pw = ph = 0.0
+        pdf_bytes, simplified = None, 0
+        names = sheet_layouts(doc)
+    else:
+        w, h = extents
+        pw, ph = choose_page(page, w, h, entities, extents_mm_factor(doc))
+        pdf_bytes, simplified = _model_pdf(doc, (pw, ph), budget, colors)
+        names = paper_layouts(doc) if layouts else []
+        if pdf_bytes is None:
+            # entities, but none visible (all on layers that are off or frozen …): the sheets, or a refusal
+            if not names:
+                code = empty_reason(scan)
+                raise InputError(code, f"{EMPTY_MESSAGES[code]} (nothing visible in model space)")
+            print("cad-engine: model space draws nothing visible; the PDF holds the layouts only",
+                  file=sys.stderr)
+    if pdf_bytes is None:
         meta["model_blank"] = True
-        pdf_bytes = None
-    if pdf_bytes is not None and not pdf_bytes:
-        raise EngineError("the PDF backend returned no data")
     rendered: list[tuple[str, tuple[float, float]]] = []
     if names:
         import pymupdf
@@ -269,7 +319,8 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
         if merged.page_count == 0:  # a blank model and every layout skipped
             merged.close()
             code = empty_reason(scan)
-            raise InputError(code, f"{EMPTY_MESSAGES[code]} (nothing visible in model space, no layout rendered)")
+            raise InputError(code, f"{EMPTY_MESSAGES[code]} (nothing visible in model space, "
+                                   "no layout rendered)")
         pdf_bytes = merged.tobytes(garbage=1, deflate=True)
         merged.close()
     model_pages = 0 if meta.get("model_blank") else 1
@@ -281,5 +332,6 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
     outputs.write_part(dst, pdf_bytes)
     outputs.commit(dst)
     sizes = " ".join(f"{name}={size[0]:g}x{size[1]:g}mm" for name, size in rendered)
-    print(f"cad-engine: dxf2pdf entities={entities} extents={w:.1f}x{h:.1f} page={pw:g}x{ph:g}mm "
+    model = f"extents={w:.1f}x{h:.1f} page={pw:g}x{ph:g}mm" if model_pages else "model=blank"
+    print(f"cad-engine: dxf2pdf entities={entities} {model} "
           f"colors={colors} layouts=[{sizes}] pdf={len(pdf_bytes) // 1024}KB", file=sys.stderr)

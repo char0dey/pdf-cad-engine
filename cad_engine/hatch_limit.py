@@ -51,7 +51,7 @@ def _loop_area(path) -> float:
     if len(pts) < 3:
         return 0.0
     s = 0.0
-    for a, b in zip(pts, pts[1:] + pts[:1]):
+    for a, b in zip(pts, pts[1:] + pts[:1], strict=True):
         s += a.x * b.y - b.x * a.y
     return abs(s) / 2.0
 

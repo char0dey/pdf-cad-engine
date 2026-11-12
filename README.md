@@ -4,7 +4,7 @@ PDF ↔ DXF conversion engine used by [PDFConvert](https://pdfconvert2.com): ext
 drawings and text from PDF into DXF, renders DXF drawings to PDF, and produces PNG previews.
 It runs as a separate process with a small, stable command-line contract.
 
-- Version: **1.1.0** (`cad_engine.__version__`, `pyproject.toml`)
+- Version: **1.4.0** (`cad_engine.__version__`, `pyproject.toml`)
 - Licence: **AGPL-3.0-or-later** (see [LICENSE](LICENSE)), © 2026 Quazar Digital OÜ
 - Python ≥ 3.12
 
@@ -14,7 +14,7 @@ It runs as a separate process with a small, stable command-line contract.
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # exact pins (server installs), OpenCV included
 .venv/bin/pip install -e .                  # or: pip install .
-.venv/bin/python -I -m cad_engine --version # -> 1.1.0
+.venv/bin/python -I -m cad_engine --version # -> 1.4.0
 ```
 
 Development: `.venv/bin/pip install -e '.[dev,raster]'` (pytest, ruff, OpenCV).
@@ -30,7 +30,7 @@ warning `raster_fallback_unavailable` in the meta instead of tracing (see below)
 python -I -m cad_engine <command> --in <file> [--out <file>] [--preview <png>]
                         [--meta <path>] [--budget-ms N] [--tmp <dir>]
                         [pdf2dxf options] [dxf2pdf options] [--light]
-python -I -m cad_engine --version          # prints "1.3.0"
+python -I -m cad_engine --version          # prints "1.4.0"
 cad-engine ...                             # console script, same arguments
 ```
 
@@ -79,7 +79,7 @@ Defaults reproduce engine 1.0. Using them with another command is a usage error 
 |------|--------|
 | `--page auto\|a4\|a3\|a2\|a1` | Paper size of the model-space page (default `auto`: A4, or A3 for drawings over 20 m or 5 000 entities). Fixed sizes: A4 297×210, A3 420×297, A2 594×420, A1 841×594 mm; orientation still follows the extents (portrait drawing → portrait page). Content is fitted with 10 mm margins. |
 | `--colors color\|mono` | `color` (default) keeps the colours (white → black); `mono` draws every entity black on white (ezdxf `ColorPolicy.BLACK`), lineweights kept. |
-| `--layouts` | After the model-space page, one page per paper-space layout in tab order that has content: paper-space entities, or viewports that show model space (status > 0, not the "active" sheet viewport, top views — the rules of the ezdxf frontend), each in its own paper size from the layout's page setup (A4 landscape when it has none). Viewports show model space through their window (clipped). Paper space is drawn 1:1 in mm when it fits the printable area (and fills at least 25 % of it), otherwise fitted to the page. A layout whose viewports look at an empty part of model space becomes a blank sheet (as a CAD program would plot it), so `pages` = 1 + the layouts `probe-dxf` reports. A layout that fails to render is skipped with the warning `layout_skipped:<name>`. Empty model space is still `empty_drawing`. |
+| `--layouts` | After the model-space page, one page per paper-space layout in tab order that has content: paper-space entities, or viewports that show model space (status > 0, not the "active" sheet viewport, top views — the rules of the ezdxf frontend), each in its own paper size from the layout's page setup (A4 landscape when it has none). Viewports show model space through their window (clipped). Paper space is drawn 1:1 in mm when it fits the printable area (and fills at least 25 % of it), otherwise fitted to the page. A layout whose viewports look at an empty part of model space becomes a blank sheet (as a CAD program would plot it), so `pages` = 1 + the layouts `probe-dxf` reports. A layout that fails to render is skipped with the warning `layout_skipped:<name>`. An empty model space (no entities, no extents, or only underlays / images / xref inserts) gives (1.4) a PDF of the sheets that draw something of their own — a paper-space entity other than a viewport, with extents — and no model page (`model_blank`); sheets with viewports alone are left out, as they would show the empty model. Without such sheets, or without `--layouts`, an empty model space is refused as before. |
 
 **stdout** carries exactly one line: the JSON meta, printed at the end of every run,
 whatever the exit code (except `--version`, which prints the version). Everything else,
@@ -107,7 +107,8 @@ Input error codes:
 - `dwg_not_dxf` — the file starts with a DWG signature (`AC10xx`), checked before parsing.
 - `aec_objects`, `external_refs_only`, `empty_drawing` (1.2) — `dxf2pdf`: nothing to draw in model
   space (no entities, no extents, only underlays / images / xref inserts, or — 1.3 — entities of which
-  none is visible and no paper-space layout to print instead), with the reason by
+  none is visible and no paper-space layout to print instead; 1.4 — with `--layouts` an empty model
+  space is refused only when no sheet draws anything of its own), with the reason by
   priority: `aec_objects` when the content scan found AutoCAD Architecture / MEP / Civil 3D entity
   classes (their objects are not in the DXF), else `external_refs_only` when it found xrefs,
   underlays or images, else `empty_drawing`. `preview-dxf` refuses an empty drawing with
@@ -137,7 +138,10 @@ File names are base names (`C:\Projects\plan.dwg` → `plan.dwg`), unique, in or
 appearance. A scan that fails sets `scanned: false` and reports nothing — it never stops
 the command. `probe-dxf --light` runs only the scan (for big files: ≈ 2 s for 40 MB on a
 laptop, against ≈ 16 s for the full probe): `entities` is the scan's model-space count,
-`empty` comes from `ms_drawable == 0`, and both stay `null` for a file cut off before `EOF`.
+`empty` is true only when model space has nothing drawable (`ms_drawable == 0`) and — 1.4 — paper
+space neither (the entities of every layout: in `ENTITIES` with group 67 = 1 and in the
+`*Paper_Space…` blocks; viewports, underlays, images and xref inserts do not count); both stay
+`null` for a file cut off before `EOF`.
 
 ### JSON meta
 
@@ -145,9 +149,9 @@ All keys are always present; `null` when not applicable to the command.
 
 | Key | Type | Set by |
 |-----|------|--------|
-| `version` | string | all (`"1.3.0"`) |
+| `version` | string | all (`"1.4.0"`) |
 | `command` | string | all |
-| `pages` | int | `pdf2dxf`, `probe-pdf`, `dxf2pdf` (PDF pages written: 1 + layouts) |
+| `pages` | int | `pdf2dxf`, `probe-pdf`, `dxf2pdf` (PDF pages written: 1 + layouts; the layouts alone with `model_blank`) |
 | `entities` | int | `pdf2dxf` (DXF entities written), `dxf2pdf` / `probe-dxf` / `preview-dxf` (model space) |
 | `layers` | int | `pdf2dxf` (layers used), DXF commands (layer table size) |
 | `text_entities` | int | `pdf2dxf` (TEXT entities), `probe-pdf` (text spans on the first 5 pages) |
@@ -158,16 +162,16 @@ All keys are always present; `null` when not applicable to the command.
 | `recognized` | object | `pdf2dxf` — `{"circles", "arcs", "hatches", "linetypes", "merged"}` counts (all 0 with the flags off): CIRCLE / ARC / HATCH entities written, entities given a DASHED/DOT linetype, entities saved by `--merge` (joined pieces + dropped duplicates) |
 | `scale` | string | `pdf2dxf` — `asis`, `1-50`, `1-100`, `1-200` |
 | `units` | string | `pdf2dxf` — `mm`, `inch` |
-| `empty` | bool | `probe-dxf` — nothing to draw in model space |
+| `empty` | bool | `probe-dxf` — nothing to draw: the answer for `dxf2pdf --layouts` (1.4: an empty model space with sheets that draw something is not empty) |
 | `empty_reason` | string | `probe-dxf` with `empty: true` — `aec_objects`, `external_refs_only` or `empty_drawing` |
 | `scanned` | bool | `probe-dxf`, `dxf2pdf` — the content scan finished (`false`: it failed, no findings) |
 | `missing` | object | `probe-dxf`, `dxf2pdf` — `{"xrefs", "underlays", "images": [file names], "aec": [families]}` |
 | `ms_entities`, `ms_drawable` | int | `probe-dxf`, `dxf2pdf` — model-space entities seen by the scan, and those that draw something (not underlays, images or xref inserts) |
 | `dxf_version` | string | DXF commands, e.g. `"AC1024"` |
 | `page_size_mm` | [w, h] | `dxf2pdf` — model-space page, e.g. `[297.0, 210.0]` |
-| `layouts` | string[] | `dxf2pdf` — paper-space layouts rendered as extra pages (`[]` without `--layouts`); `probe-dxf` — paper-space layouts with content |
+| `layouts` | string[] | `dxf2pdf` — paper-space layouts rendered as extra pages (`[]` without `--layouts`); `probe-dxf` — paper-space layouts with content (1.4: with an empty model space, the sheets the PDF will hold) |
 | `simplified_hatches` | int | `dxf2pdf` (1.3) — hatches drawn as their outline because the pattern would produce more than 1 000 000 line segments (model space and rendered layouts, each insert counted) |
-| `model_blank` | bool | `dxf2pdf` (1.3) — `true` when model space has entities but none visible and the PDF holds only the paper-space layouts (`page_size_mm` is then the first layout's) |
+| `model_blank` | bool | `dxf2pdf` (1.3) — `true` when the PDF holds only the paper-space layouts, no model page: model space has entities but none visible, or (1.4) nothing to draw at all (`page_size_mm` is then the first layout's) |
 | `warnings` | string[] | all — `[]` or e.g. `"raster_fallback_unavailable"`, `"layout_skipped:<name>"` |
 | `ms` | int | all — wall time since start |
 | `code`, `message` | string | on failure (exit ≠ 0) |
@@ -178,8 +182,8 @@ Examples (`pdf2dxf --arcs --hatch-fills --linetypes --merge --raster-fallback` o
 plan PDF; `dxf2pdf --layouts` on a plan with two paper-space layouts):
 
 ```json
-{"version":"1.3.0","command":"pdf2dxf","pages":1,"entities":1273,"layers":8,"text_entities":0,"images":0,"has_vectors":true,"text_as_outlines":true,"traced_pages":[],"recognized":{"circles":1,"arcs":4,"hatches":10,"linetypes":179,"merged":3},"scale":"asis","units":"mm","empty":null,"dxf_version":null,"page_size_mm":null,"layouts":null,"scanned":null,"missing":null,"ms_entities":null,"ms_drawable":null,"empty_reason":null,"warnings":[],"ms":319,"code":null,"message":null}
-{"version":"1.3.0","command":"dxf2pdf","pages":3,"entities":19,"layers":9,"text_entities":null,"images":null,"has_vectors":null,"text_as_outlines":null,"traced_pages":null,"recognized":null,"scale":null,"units":null,"empty":null,"dxf_version":"AC1024","page_size_mm":[297.0,210.0],"layouts":["Plan A3","Detail"],"scanned":true,"missing":{"xrefs":[],"underlays":[],"images":[],"aec":[]},"ms_entities":19,"ms_drawable":19,"empty_reason":null,"warnings":[],"ms":863,"code":null,"message":null}
+{"version":"1.4.0","command":"pdf2dxf","pages":1,"entities":1273,"layers":8,"text_entities":0,"images":0,"has_vectors":true,"text_as_outlines":true,"traced_pages":[],"recognized":{"circles":1,"arcs":4,"hatches":10,"linetypes":179,"merged":3},"scale":"asis","units":"mm","empty":null,"dxf_version":null,"page_size_mm":null,"layouts":null,"scanned":null,"missing":null,"ms_entities":null,"ms_drawable":null,"empty_reason":null,"warnings":[],"ms":319,"code":null,"message":null}
+{"version":"1.4.0","command":"dxf2pdf","pages":3,"entities":19,"layers":9,"text_entities":null,"images":null,"has_vectors":null,"text_as_outlines":null,"traced_pages":null,"recognized":null,"scale":null,"units":null,"empty":null,"dxf_version":"AC1024","page_size_mm":[297.0,210.0],"layouts":["Plan A3","Detail"],"scanned":true,"missing":{"xrefs":[],"underlays":[],"images":[],"aec":[]},"ms_entities":19,"ms_drawable":19,"empty_reason":null,"warnings":[],"ms":863,"code":null,"message":null}
 ```
 
 ## What the conversions do

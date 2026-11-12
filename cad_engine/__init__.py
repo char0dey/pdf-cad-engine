@@ -6,4 +6,4 @@ The package is meant to be run as a separate process
 (``python -I -m cad_engine <command> ...``); see README.md for the CLI contract.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"

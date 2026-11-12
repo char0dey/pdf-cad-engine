@@ -629,7 +629,8 @@ def _stream(content: bytes, extra: bytes = b"") -> bytes:
     import zlib
 
     packed = zlib.compress(content, 6)
-    return b"<< /Length %d /Filter /FlateDecode %s>>\nstream\n" % (len(packed), extra) + packed + b"\nendstream"
+    head = b"<< /Length %d /Filter /FlateDecode %s>>\nstream\n" % (len(packed), extra)
+    return head + packed + b"\nendstream"
 
 
 def _lines(n: int, seed: int = 7) -> bytes:
@@ -660,7 +661,8 @@ def build_dense_lines_pdf(out: Path, lines: int, *, form_calls: int = 0, noise: 
 
 
 def build_dense_hatch_dxf(out: Path, *, pattern: str = "AR-CONC", scale: float = 0.005, width: float = 8000.0,
-                          height: float = 2000.0, inserts: int = 0, paper: bool = False, lines: int = 300) -> Path:
+                          height: float = 2000.0, inserts: int = 0, paper: bool = False,
+                          lines: int = 300) -> Path:
     """The Civil 3D plan of PROD 2026-11-10, generated: metres, ``lines`` ordinary lines and one
     hatch ``pattern`` at ``scale`` over ``width`` × ``height`` — in model space, in a block inserted
     ``inserts`` times, or (``paper``) on a paper-space layout. ``pattern="SOLID"`` gives a fill."""
@@ -714,4 +716,36 @@ def build_blank_model_dxf(out: Path, *, with_layout: bool) -> Path:
         sheet.add_lwpolyline([(0, 0), (400, 0), (400, 280), (0, 280)], close=True)
         sheet.add_text("TITLE", height=5).set_placement((300, 10))
     doc.saveas(out)
+    return out
+
+
+def build_sheets_only_dxf(out: Path, *, sheets=("A1", "A2"), content: str = "drawing", lines: int = 2,
+                          fmt: str = "asc") -> Path:
+    """Engine 1.4: model space without a single entity, the drawing on paper-space sheets (the DWG
+    of PROD 2026-11-12). Each sheet is A3 landscape; ``content``: ``"drawing"`` — a frame,
+    ``lines`` lines, a title and a stamp text; ``"viewport"`` — only a viewport onto the empty
+    model; ``"xref"`` — only an inserted xref (an external title block); ``"none"`` — nothing.
+    The first sheet is the active layout, so its entities are written to ENTITIES with group
+    67 = 1 and the others' to their ``*Paper_Space<n>`` blocks."""
+    import ezdxf
+
+    doc = ezdxf.new("R2010")
+    if content == "xref":
+        doc.add_xref_def(r"C:\Standards\title-block.dwg", "TITLE_BLOCK")
+    for name in sheets:
+        sheet = doc.layouts.new(name)
+        sheet.page_setup(size=(420, 297), margins=(10, 10, 10, 10), units="mm")
+        if content == "drawing":
+            sheet.add_lwpolyline([(0, 0), (400, 0), (400, 277), (0, 277)], close=True)
+            for i in range(lines):
+                sheet.add_line((20, 40 + i * 0.01), (380, 40 + (i % 200) + 20))
+            sheet.add_text(f"SHEET {name}", height=6).set_placement((20, 250))
+            sheet.add_text("STAMP / SCALE 1:100", height=3).set_placement((300, 10))
+        elif content == "viewport":
+            sheet.add_viewport(center=(200, 138), size=(380, 257), view_center_point=(0, 0), view_height=1000)
+        elif content == "xref":
+            sheet.add_blockref("TITLE_BLOCK", (0, 0))
+    if sheets:
+        doc.layouts.set_active_layout(sheets[0])
+    doc.saveas(out, fmt=fmt)
     return out

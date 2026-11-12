@@ -16,7 +16,10 @@ document, so it costs little even for drawings of tens of megabytes. It finds:
 
 File names are base names (no folder), unique, in order of appearance. It also counts the
 model-space entities as ezdxf counts them (``ms_entities``) and those that draw something
-(``ms_drawable``: everything but underlays, images and inserts of xref blocks).
+(``ms_drawable``: everything but underlays, images and inserts of xref blocks), and the same
+for paper space (1.4: ``ps_entities`` / ``ps_drawable``, viewports not counted): entities of the
+active layout in ENTITIES with group 67 = 1, those of the other layouts in ``*Paper_Space…``
+blocks. A drawing has nothing to draw only when neither space has anything drawable.
 """
 
 from __future__ import annotations
@@ -40,6 +43,7 @@ NOT_COUNTED = frozenset({"ATTRIB", "VERTEX", "SEQEND", "VIEWPORT"})
 AEC_FAMILIES = (("AEC_", "architecture"), ("AECS_", "architecture"), ("AECB_", "mep"), ("AECC_", "civil"))
 XREF_FLAGS = 4 | 8
 MODEL_SPACE_BLOCK = "*MODEL_SPACE"
+PAPER_SPACE_BLOCK = "*PAPER_SPACE"  # prefix: *Paper_Space, *Paper_Space0, *Paper_Space1 …
 TICK_EVERY = 50_000  # records between budget checks
 
 #: Group codes kept per record type (everything else is skipped without a look).
@@ -60,6 +64,9 @@ class ScanResult:
     aec: list[str] = field(default_factory=list)
     ms_entities: int = 0
     ms_drawable: int = 0
+    #: Paper space (all layouts), counted like model space; viewports are not counted (1.4).
+    ps_entities: int = 0
+    ps_drawable: int = 0
     #: The scan reached EOF; a cut-off file still reports what was found, but its counts
     #: are not used to call the drawing empty.
     complete: bool = False
@@ -72,8 +79,15 @@ class ScanResult:
         return bool(self.xrefs or self.underlays or self.images)
 
     @property
-    def nothing_to_draw(self) -> bool:
+    def model_nothing_to_draw(self) -> bool:
+        """Model space has nothing drawable (no entities, or only underlays / images / xref inserts)."""
         return self.complete and self.ms_drawable == 0
+
+    @property
+    def nothing_to_draw(self) -> bool:
+        """Neither model space nor any paper-space layout has anything drawable (1.4: before,
+        model space only — a drawing on its sheets alone was called empty)."""
+        return self.model_nothing_to_draw and self.ps_drawable == 0
 
 
 def base_name(path: str) -> str:
@@ -143,14 +157,16 @@ def scan_tags(tags, budget: Budget | None = None) -> ScanResult:
     xref_blocks: dict[str, str] = {}  # upper-case block name -> base name of the referenced file
     inserted: set[str] = set()
     ms_inserts: Counter = Counter()
+    ps_inserts: Counter = Counter()
     not_drawn = 0
+    ps_not_drawn = 0
     referenced: set[str] = set()  # handles of definitions referenced by an underlay / IMAGE
     underlay_defs: list[tuple[str, str]] = []
     image_defs: list[tuple[str, str]] = []
     aec: list[str] = []
 
     def finish() -> None:
-        nonlocal section, block, not_drawn
+        nonlocal section, block, not_drawn, ps_not_drawn
         if fields is None:
             return
         if rtype == "SECTION":
@@ -180,14 +196,21 @@ def scan_tags(tags, budget: Budget | None = None) -> ScanResult:
             inserted.add(_decode(fields.get(2, "")).upper())
         elif rtype in REFERENCE_ENTITIES and 340 in fields:
             referenced.add(_decode(fields[340]).upper())
-        in_model = (section == "ENTITIES" or block == MODEL_SPACE_BLOCK) and _int(fields.get(67, 0)) != 1
-        if not in_model or rtype in NOT_COUNTED:
+        if rtype in NOT_COUNTED:
             return
-        result.ms_entities += 1
-        if rtype in NOT_DRAWN:
-            not_drawn += 1
-        elif rtype == "INSERT":
-            ms_inserts[_decode(fields.get(2, "")).upper()] += 1
+        paper = _int(fields.get(67, 0)) == 1
+        if (section == "ENTITIES" or block == MODEL_SPACE_BLOCK) and not paper:
+            result.ms_entities += 1
+            if rtype in NOT_DRAWN:
+                not_drawn += 1
+            elif rtype == "INSERT":
+                ms_inserts[_decode(fields.get(2, "")).upper()] += 1
+        elif (section == "ENTITIES" and paper) or block.startswith(PAPER_SPACE_BLOCK):
+            result.ps_entities += 1
+            if rtype in NOT_DRAWN:
+                ps_not_drawn += 1
+            elif rtype == "INSERT":
+                ps_inserts[_decode(fields.get(2, "")).upper()] += 1
 
     for code, value in tags:
         if code != 0:
@@ -236,6 +259,8 @@ def scan_tags(tags, budget: Budget | None = None) -> ScanResult:
     result.aec = _unique(aec)
     xref_inserts = sum(count for name, count in ms_inserts.items() if name in xref_blocks)
     result.ms_drawable = max(result.ms_entities - not_drawn - xref_inserts, 0)
+    ps_xref_inserts = sum(count for name, count in ps_inserts.items() if name in xref_blocks)
+    result.ps_drawable = max(result.ps_entities - ps_not_drawn - ps_xref_inserts, 0)
     return result
 
 
