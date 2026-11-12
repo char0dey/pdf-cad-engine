@@ -155,6 +155,11 @@ def hidden_layer_dxf(gen) -> Path:
 
 
 @pytest.fixture(scope="session")
+def broken_insert_dxf(gen) -> Path:
+    return make_sample.build_broken_insert_dxf(gen / "broken_insert.dxf")
+
+
+@pytest.fixture(scope="session")
 def white_dxf(gen) -> Path:
     return make_sample.build_white_dxf(gen / "white.dxf")
 

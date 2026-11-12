@@ -107,6 +107,19 @@ def test_hidden_layer_not_rendered(hidden_layer_dxf, tmp_path):
     assert (0.0, 0.0, 0.0) in colors
 
 
+def test_block_refs_without_block_are_dropped(broken_insert_dxf, tmp_path):
+    """PROD 2026-11-12: one INSERT without a block name failed the whole drawing (exit 5,
+    DXFTypeError). Now the broken references are dropped and the rest is drawn."""
+    meta, pdf = render_ok(broken_insert_dxf, tmp_path)
+    run = run_engine("dxf2pdf", "--in", broken_insert_dxf, "--out", tmp_path / "again.pdf")
+    assert "3 block reference(s) without a block definition dropped" in run.stderr
+    assert meta["entities"] == 2  # the line and the good INSERT of B
+    kinds = {d["type"] for d in pdf[0].get_drawings()}
+    assert kinds  # the line and B's circle are on the page
+    probe = run_engine("probe-dxf", "--in", broken_insert_dxf)
+    assert probe.returncode == 0, probe.stderr
+
+
 def test_white_becomes_black(white_dxf, tmp_path):
     _, pdf = render_ok(white_dxf, tmp_path)
     strokes = [d for d in pdf[0].get_drawings() if d.get("color") is not None]

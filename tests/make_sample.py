@@ -130,6 +130,34 @@ def build_hidden_layer_dxf(out: Path) -> Path:
     return out
 
 
+def build_broken_insert_dxf(out: Path) -> Path:
+    """A line and a block of a circle, plus three block references that point at no block: one without
+    a name in model space, one naming an undefined block, one without a name inside the block definition
+    (what dwgdxf 1.0.5 wrote from a DWG on PROD 2026-11-12). ezdxf writes only valid ones, so the names
+    are cut out of the file text afterwards."""
+    import ezdxf
+
+    doc = ezdxf.new("R2018")
+    block = doc.blocks.new("B")
+    block.add_circle((0, 0), 300)
+    doc.blocks.new("GONE").add_line((0, 0), (1, 1))
+    doc.blocks.new("UNDEFINED").add_line((0, 0), (1, 1))
+    block.add_blockref("GONE", (0, 0))  # nameless in the block definition
+    msp = doc.modelspace()
+    msp.add_line((-1000, -1000), (1000, 1000))
+    msp.add_blockref("B", (500, 0))
+    msp.add_blockref("GONE", (0, 500))  # nameless in model space
+    msp.add_blockref("UNDEFINED", (0, -500))  # its block is removed below
+    doc.saveas(out)
+    text = out.read_text(encoding="utf-8")
+    nameless = "\nAcDbBlockReference\n  2\nGONE\n"
+    assert text.count(nameless) == 2
+    text = text.replace(nameless, "\nAcDbBlockReference\n")
+    text = text.replace("\nAcDbBlockReference\n  2\nUNDEFINED\n", "\nAcDbBlockReference\n  2\nNOT_A_BLOCK\n")
+    out.write_text(text, encoding="utf-8")
+    return out
+
+
 def build_white_dxf(out: Path) -> Path:
     """Lines in ACI 7 and in true-colour white: both must print black on white paper."""
     import ezdxf
