@@ -213,6 +213,10 @@ background, colours kept (ACI 7 and true-colour white print black) or all black 
 `--colors mono`, relative lineweights, invisible layers and entities skipped; with
 `--layouts` the paper-space layouts follow as extra pages (pages merged with PyMuPDF). Damaged files go through `ezdxf.recover`; a file cut off at the end is
 closed after the last complete object first, so everything that was read is rendered.
+ezdxf bugs that real drawings hit are fixed in the engine process (`cad_engine/ezdxf_fixes.py`,
+installed by `load_dxf`, only for the pinned ezdxf 1.4.5): since 1.5.1 a leader (MULTILEADER)
+whose landing has length 0 is transformed without dividing by zero — ezdxf transforms it whenever a
+block is exploded, so one such leader in an inserted block used to fail the whole drawing (exit 5).
 The recording is written to PDF by `cad_engine/pdf_backend.py` (1.2), a subclass of ezdxf's
 PyMuPDF backend with the same output (paths, colours, widths, one PDF layer per drawing
 layer) but linear time: the page content goes into a new content stream every 500 paths

@@ -173,6 +173,19 @@ def far_dxf(gen):
 
 
 @pytest.fixture(scope="session")
+def mleader_dxf(gen):
+    """``mleader_dxf(kind)`` → path of ``make_sample.build_mleader_dxf`` for that kind, built once."""
+    cache: dict[str, Path] = {}
+
+    def build(kind: str) -> Path:
+        if kind not in cache:
+            cache[kind] = make_sample.build_mleader_dxf(gen / f"mleader_{kind}.dxf", kind)
+        return cache[kind]
+
+    return build
+
+
+@pytest.fixture(scope="session")
 def white_dxf(gen) -> Path:
     return make_sample.build_white_dxf(gen / "white.dxf")
 

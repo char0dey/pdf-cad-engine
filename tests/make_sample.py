@@ -211,6 +211,77 @@ def build_far_object_dxf(out: Path, kind: str) -> Path:
     return out
 
 
+MLEADER_KINDS = ("plain", "in_model", "in_block", "rotated", "nested_paper", "null_vector", "nonuniform", "dogleg")
+
+
+def build_mleader_dxf(out: Path, kind: str) -> Path:
+    """A small plan plus, by ``kind``, a leader (MULTILEADER with text) whose landing (dogleg) has
+    length 0 — engine 1.5.1. ezdxf 1.4.5 divides by zero transforming such a leader, i.e. whenever it
+    sits in an inserted block: PROD 2026-11-13 (dwg-to-pdf, Civil 3D, exit 5 «ZeroDivisionError» in
+    ``mleader.py`` ``LeaderData.transform``).
+
+    - ``plain``: the plan alone;
+    - ``in_model``: the leader drawn straight in model space at P = (200, 150), the reference picture;
+    - ``in_block``: the same leader in block TAG, inserted at P (the PROD case);
+    - ``rotated``: TAG inserted at P rotated 90° with a uniform scale of 2;
+    - ``nested_paper``: TAG inside block OUTER inserted in model space, plus TAG on a sheet;
+    - ``null_vector``: landing length 0 and landing direction (0, 0, 0);
+    - ``nonuniform``: TAG inserted with x scale 2, y scale 1;
+    - ``dogleg``: a landing 25 units long, TAG inserted rotated 30° with scale 1.5 (unchanged case).
+    """
+    import ezdxf
+    from ezdxf.math import Vec2, Vec3
+    from ezdxf.render.mleader import ConnectionSide
+
+    if kind not in MLEADER_KINDS:
+        raise ValueError(kind)
+    doc = ezdxf.new("R2018", setup=True)
+    msp = doc.modelspace()
+    msp.add_lwpolyline([(0, 0), (400, 0), (400, 300), (0, 300)], close=True)
+    for i in range(1, 8):
+        msp.add_line((i * 50, 0), (i * 50, 300))
+    if kind == "plain":
+        doc.saveas(out)
+        return out
+
+    def leader(space, at: tuple[float, float]) -> None:
+        x, y = at
+        ml = space.add_multileader_mtext("Standard")
+        ml.set_content("STA 1+00", char_height=12)
+        ml.add_leader_line(ConnectionSide.left, [Vec2(x - 90, y - 60)])
+        ml.build(insert=Vec2(x, y))
+        for data in ml.context.leaders:
+            data.dogleg_length = 25.0 if kind == "dogleg" else 0.0
+            if kind == "null_vector":
+                data.dogleg_vector = Vec3(0, 0, 0)
+
+    p = (200, 150)
+    if kind == "in_model":
+        leader(msp, p)
+        doc.saveas(out)
+        return out
+    tag = doc.blocks.new("TAG")
+    leader(tag, (0, 0))
+    if kind == "rotated":
+        msp.add_blockref("TAG", p, dxfattribs={"rotation": 90, "xscale": 2, "yscale": 2, "zscale": 2})
+    elif kind == "nested_paper":
+        outer = doc.blocks.new("OUTER")
+        outer.add_blockref("TAG", (0, 0))
+        msp.add_blockref("OUTER", p)
+        sheet = doc.layouts.new("Sheet")
+        sheet.page_setup(size=(420, 297), margins=(10, 10, 10, 10), units="mm")
+        sheet.add_lwpolyline([(20, 20), (400, 20), (400, 277), (20, 277)], close=True)
+        sheet.add_blockref("TAG", (210, 150))
+    elif kind == "nonuniform":
+        msp.add_blockref("TAG", p, dxfattribs={"xscale": 2, "yscale": 1})
+    elif kind == "dogleg":
+        msp.add_blockref("TAG", p, dxfattribs={"rotation": 30, "xscale": 1.5, "yscale": 1.5, "zscale": 1.5})
+    else:  # in_block, null_vector
+        msp.add_blockref("TAG", p)
+    doc.saveas(out)
+    return out
+
+
 def build_white_dxf(out: Path) -> Path:
     """Lines in ACI 7 and in true-colour white: both must print black on white paper."""
     import ezdxf
