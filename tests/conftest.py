@@ -160,6 +160,19 @@ def broken_insert_dxf(gen) -> Path:
 
 
 @pytest.fixture(scope="session")
+def far_dxf(gen):
+    """``far_dxf(kind)`` → path of `make_sample.build_far_object_dxf` (built once per kind)."""
+    built: dict[str, Path] = {}
+
+    def get(kind: str) -> Path:
+        if kind not in built:
+            built[kind] = make_sample.build_far_object_dxf(gen / f"far_{kind}.dxf", kind)
+        return built[kind]
+
+    return get
+
+
+@pytest.fixture(scope="session")
 def white_dxf(gen) -> Path:
     return make_sample.build_white_dxf(gen / "white.dxf")
 

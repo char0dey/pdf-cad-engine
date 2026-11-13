@@ -120,6 +120,9 @@ def preview_dxf(src: str, dst: str, *, budget: Budget, meta: dict) -> None:
     budget.check()
     backend = render_modelspace(doc, budget)
     budget.check()
+    meta["far_parts"] = backend.far.dropped
+    if backend.far.dropped and backend.far.size is not None:
+        w, h = backend.far.size  # the drawing without its far parts (1.5)
     rendered = backend.get_replay(_preview_page(w, h), settings=layout.Settings(fit_page=True))
     page = rendered.page
     zoom = PREVIEW_LONGEST_PX / max(page.rect.width, page.rect.height)

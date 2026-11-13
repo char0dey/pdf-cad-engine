@@ -38,7 +38,10 @@ from collections.abc import Iterable
 
 import pymupdf
 from ezdxf.addons.drawing.pymupdf import PyMuPdfBackend, PyMuPdfRenderBackend
+from ezdxf.math import BoundingBox2d
 from ezdxf.path import Command
+
+from cad_engine.far_objects import FarTrim, trim_far_parts
 
 #: Paths per content stream; small enough to keep appends cheap, few streams per page.
 CHUNK_PATHS = 500
@@ -185,7 +188,32 @@ class FastRenderBackend(PyMuPdfRenderBackend):
         self.finish_filling(self.content_shape, properties)
 
 
-class FastPdfBackend(PyMuPdfBackend):
+class FarPartsMixin:
+    """`trim_far_parts` for an ezdxf PDF recorder (1.5): leaves out recorded parts far from the
+    drawing (`cad_engine.far_objects`) and hands the extents it measured to the replay, so the
+    records are not measured twice. Mixed into `FastPdfBackend` (and, in the tests, into
+    ezdxf's own backend for the same-picture comparison)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.simplified_hatches = 0
+        self.far = FarTrim(0, None)
+        self._measured_box: tuple[float, float, float, float] | None = None
+
+    def trim_far_parts(self) -> FarTrim:
+        self.far = trim_far_parts(self)
+        self._measured_box = self.far.box
+        return self.far
+
+    def player(self):
+        player = super().player()
+        box, self._measured_box = self._measured_box, None  # once: the replay transforms the records
+        if box is not None:
+            player._bbox = BoundingBox2d([(box[0], box[1]), (box[2], box[3])])
+        return player
+
+
+class FastPdfBackend(FarPartsMixin, PyMuPdfBackend):
     """``PyMuPdfBackend`` whose replay goes to `FastRenderBackend`."""
 
     def make_backend(self, page, settings) -> FastRenderBackend:

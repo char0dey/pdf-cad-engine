@@ -34,11 +34,15 @@ def timed(src: Path, out: Path) -> float:
 
 @pytest.fixture
 def use_stock(monkeypatch):
-    """Switch `render_layout` to ezdxf's own backend (it imports `FastPdfBackend` per call)."""
+    """Switch `render_layout` to ezdxf's own backend (it imports `FastPdfBackend` per call); the
+    far-parts step (1.5) stays, it changes nothing on these drawings."""
     from ezdxf.addons.drawing.pymupdf import PyMuPdfBackend
 
+    class StockPdfBackend(pdf_backend.FarPartsMixin, PyMuPdfBackend):
+        pass
+
     def switch() -> None:
-        monkeypatch.setattr(pdf_backend, "FastPdfBackend", PyMuPdfBackend)
+        monkeypatch.setattr(pdf_backend, "FastPdfBackend", StockPdfBackend)
 
     return switch
 

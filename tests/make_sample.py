@@ -158,6 +158,59 @@ def build_broken_insert_dxf(out: Path) -> Path:
     return out
 
 
+FAR_KINDS = ("plain", "huge", "stray", "in_block", "paper", "near")
+
+
+def build_far_object_dxf(out: Path, kind: str) -> Path:
+    """A small plan (frame, grid, a filled triangle) plus, by ``kind``, one object far from it
+    (engine 1.5, far parts):
+
+    - ``plain``: the plan alone, the reference picture;
+    - ``huge``: a SOLID with a vertex at x = 1e39 — PROD 2026-11-13 (dwg-to-pdf, exit 5
+      «TypeError … new_FzPoint»);
+    - ``stray``: the plan in survey coordinates (5e6, 4e6) and a POINT left at the origin;
+    - ``in_block``: the plan drawn through a block whose definition also holds a SOLID 1e9 away;
+    - ``paper``: the plan on a sheet (paper space, A3 layout) with a LINE end at 1e39 on it;
+    - ``near``: a second copy of the plan 50 plan sizes away — far, but a real part of a drawing.
+    """
+    import ezdxf
+
+    if kind not in FAR_KINDS:
+        raise ValueError(kind)
+    doc = ezdxf.new("R2010")
+    msp = doc.modelspace()
+    ox, oy = (5e6, 4e6) if kind == "stray" else (0.0, 0.0)
+
+    def plan(space, dx: float = 0.0, dy: float = 0.0) -> None:
+        x, y = ox + dx, oy + dy
+        space.add_lwpolyline([(x, y), (x + 400, y), (x + 400, y + 300), (x, y + 300)], close=True)
+        for i in range(1, 8):
+            space.add_line((x + i * 50, y), (x + i * 50, y + 300))
+        space.add_solid([(x + 20, y + 20), (x + 120, y + 20), (x + 20, y + 120)])
+
+    if kind == "in_block":
+        block = doc.blocks.new("PLAN")
+        plan(block)
+        block.add_solid([(1e9, 1e9), (1e9 + 10, 1e9), (1e9, 1e9 + 10)])
+        msp.add_blockref("PLAN", (0, 0))
+    elif kind == "paper":
+        sheet = doc.layouts.new("Sheet")
+        sheet.page_setup(size=(420, 297), margins=(10, 10, 10, 10), units="mm")
+        plan(sheet, 10, -2)
+        sheet.add_line((50, 50), (1e39, 50))
+        msp.add_line((0, 0), (100, 100))
+    else:
+        plan(msp)
+        if kind == "huge":
+            msp.add_solid([(0, 0), (1e39, 0), (0, 10)])
+        elif kind == "stray":
+            msp.add_point((0, 0))
+        elif kind == "near":
+            plan(msp, 50 * 400, 0)
+    doc.saveas(out)
+    return out
+
+
 def build_white_dxf(out: Path) -> Path:
     """Lines in ACI 7 and in true-colour white: both must print black on white paper."""
     import ezdxf

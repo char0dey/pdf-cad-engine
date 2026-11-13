@@ -26,6 +26,7 @@ from cad_engine import outputs
 from cad_engine.budget import Budget, Ticker
 from cad_engine.dxfio import check_dxf_signature, extents_mm_factor, load_dxf
 from cad_engine.errors import EngineError, InputError
+from cad_engine.far_objects import FAR_RATIO
 from cad_engine.scan import EMPTY_MESSAGES, ScanResult, apply_to_meta, empty_reason, safe_scan
 
 if TYPE_CHECKING:
@@ -147,7 +148,8 @@ def render_layout(doc: Drawing, layout, budget: Budget, colors: str = "color") -
     """Record one layout with the ezdxf frontend (budget checked every 200 entities); the
     recording replays into the faster PDF output of `cad_engine.pdf_backend`. Hatch patterns
     are capped (`cad_engine.hatch_limit`); ``backend.simplified_hatches`` says how many hatches
-    of this layout were drawn as outlines."""
+    of this layout were drawn as outlines. Parts far from the drawing are left out (1.5,
+    `cad_engine.far_objects`); ``backend.far`` says how many and the extents of the rest."""
     from ezdxf.addons.drawing import RenderContext
 
     from cad_engine.hatch_limit import EngineFrontend
@@ -165,6 +167,11 @@ def render_layout(doc: Drawing, layout, budget: Budget, colors: str = "color") -
 
     frontend.draw_layout(layout, finalize=True, filter_func=keep)
     backend.simplified_hatches = frontend.simplified_hatches
+    budget.check()
+    far = backend.trim_far_parts()
+    if far.dropped:
+        print(f"cad-engine: {far.dropped} drawn part(s) left out in {getattr(layout, 'name', '?')!r}: more than "
+              f"{FAR_RATIO:g}x the drawing's size away from it, or broken coordinates", file=sys.stderr)
     return backend
 
 
@@ -196,10 +203,10 @@ def _blank_page(width_mm: float, height_mm: float) -> bytes:
 
 
 def _layout_pdf(doc: Drawing, name: str, budget: Budget,
-                colors: str) -> tuple[bytes, tuple[float, float], int]:
-    """One paper-space layout as a one-page PDF in its paper size. A layout whose viewports
-    look at an empty part of model space draws nothing: it becomes a blank sheet, as a CAD
-    program would plot it."""
+                colors: str) -> tuple[bytes, tuple[float, float], int, int]:
+    """One paper-space layout as a one-page PDF in its paper size, the simplified hatches and
+    the parts left out as far from the sheet. A layout whose viewports look at an empty part
+    of model space draws nothing: it becomes a blank sheet, as a CAD program would plot it."""
     from ezdxf import bbox
     from ezdxf.addons.drawing import layout as page_layout
 
@@ -210,15 +217,20 @@ def _layout_pdf(doc: Drawing, name: str, budget: Budget,
         page = page_layout.Page(*A4_MM, page_layout.Units.mm, margins=page_layout.Margins.all(MARGIN_MM))
     backend = render_layout(doc, paper, budget, colors)
     hatches = backend.simplified_hatches
+    far = backend.far
     budget.check()
     # paper space is drawn in paper units: keep 1:1 when the content fits the printable area,
     # otherwise (inch-based or oversized layouts) fit it to the page
-    ext = bbox.extents(layout_content(paper), fast=True)
     inner_w = page.width_in_mm - page.margins_in_mm.left - page.margins_in_mm.right
     inner_h = page.height_in_mm - page.margins_in_mm.top - page.margins_in_mm.bottom
     one_to_one = False
-    if ext.has_data and inner_w > 0 and inner_h > 0:
-        w, h = float(ext.size.x), float(ext.size.y)
+    if far.dropped and far.size is not None:  # the sheet without its far parts (1.5)
+        content = far.size
+    else:
+        ext = bbox.extents(layout_content(paper), fast=True)
+        content = (float(ext.size.x), float(ext.size.y)) if ext.has_data else None
+    if content is not None and inner_w > 0 and inner_h > 0:
+        w, h = content
         fits = w <= inner_w * 1.001 and h <= inner_h * 1.001
         one_to_one = fits and max(w / inner_w, h / inner_h) >= LAYOUT_FIT_MIN_RATIO
     settings = page_layout.Settings(fit_page=not one_to_one, scale=1.0)
@@ -229,30 +241,27 @@ def _layout_pdf(doc: Drawing, name: str, budget: Budget,
         if "empty bounding box" not in str(exc):
             raise
         print(f"cad-engine: layout {name!r} draws nothing; blank sheet", file=sys.stderr)
-        return _blank_page(*size), size, hatches
+        return _blank_page(*size), size, hatches, far.dropped
     if not data:
         raise EngineError(f"the PDF backend returned no data for layout {name!r}")
-    return data, size, hatches
+    return data, size, hatches, far.dropped
 
 
-def _model_pdf(doc: Drawing, size_mm: tuple[float, float], budget: Budget,
-               colors: str) -> tuple[bytes | None, int]:
-    """Model space as a one-page PDF and the number of simplified hatches; None instead of the
-    PDF when nothing in model space is visible (all on layers that are off or frozen …)."""
+def _model_pdf(backend: FastPdfBackend, size_mm: tuple[float, float]) -> bytes | None:
+    """Recorded model space (`render_modelspace`) as a one-page PDF; None when nothing in model
+    space is visible (all on layers that are off or frozen …)."""
     from ezdxf.addons.drawing import layout
 
-    backend = render_modelspace(doc, budget, colors)
-    budget.check()
     model_page = layout.Page(*size_mm, layout.Units.mm, margins=layout.Margins.all(MARGIN_MM))
     try:
         data = backend.get_pdf_bytes(model_page, settings=layout.Settings(fit_page=True))
     except ValueError as exc:
         if "empty bounding box" not in str(exc):
             raise
-        return None, backend.simplified_hatches
+        return None
     if not data:
         raise EngineError("the PDF backend returned no data")
-    return data, backend.simplified_hatches
+    return data
 
 
 def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto", colors: str = "color",
@@ -278,12 +287,17 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
         # 1.4: model space has nothing to draw, the sheets have: no model page, the sheets only
         print("cad-engine: model space is empty; the PDF holds the layouts only", file=sys.stderr)
         w = h = pw = ph = 0.0
-        pdf_bytes, simplified = None, 0
+        pdf_bytes, simplified, far_parts = None, 0, 0
         names = sheet_layouts(doc)
     else:
         w, h = extents
+        backend = render_modelspace(doc, budget, colors)
+        budget.check()
+        if backend.far.dropped and backend.far.size is not None:
+            w, h = backend.far.size  # the page follows the drawing without its far parts (1.5)
         pw, ph = choose_page(page, w, h, entities, extents_mm_factor(doc))
-        pdf_bytes, simplified = _model_pdf(doc, (pw, ph), budget, colors)
+        pdf_bytes = _model_pdf(backend, (pw, ph))
+        simplified, far_parts = backend.simplified_hatches, backend.far.dropped
         names = paper_layouts(doc) if layouts else []
         if pdf_bytes is None:
             # entities, but none visible (all on layers that are off or frozen …): the sheets, or a refusal
@@ -303,7 +317,7 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
         for name in names:
             budget.check()
             try:
-                data, size, hatches = _layout_pdf(doc, name, budget, colors)
+                data, size, hatches, far_dropped = _layout_pdf(doc, name, budget, colors)
             except MemoryError:
                 raise
             except Exception as exc:  # one broken layout must not cost the model-space page
@@ -315,6 +329,7 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
                 merged.insert_pdf(part)
             rendered.append((name, size))
             simplified += hatches
+            far_parts += far_dropped
         budget.check()
         if merged.page_count == 0:  # a blank model and every layout skipped
             merged.close()
@@ -328,6 +343,7 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
     meta["page_size_mm"] = [pw, ph] if model_pages else list(rendered[0][1])
     meta["layouts"] = [name for name, _ in rendered]
     meta["simplified_hatches"] = simplified
+    meta["far_parts"] = far_parts
     budget.check()
     outputs.write_part(dst, pdf_bytes)
     outputs.commit(dst)

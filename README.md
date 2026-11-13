@@ -171,6 +171,7 @@ All keys are always present; `null` when not applicable to the command.
 | `page_size_mm` | [w, h] | `dxf2pdf` — model-space page, e.g. `[297.0, 210.0]` |
 | `layouts` | string[] | `dxf2pdf` — paper-space layouts rendered as extra pages (`[]` without `--layouts`); `probe-dxf` — paper-space layouts with content (1.4: with an empty model space, the sheets the PDF will hold) |
 | `simplified_hatches` | int | `dxf2pdf` (1.3) — hatches drawn as their outline because the pattern would produce more than 1 000 000 line segments (model space and rendered layouts, each insert counted) |
+| `far_parts` | int | `dxf2pdf`, `preview-dxf` (1.5) — drawn parts left out because they lie more than 1000 times the drawing's size away from it, or have broken coordinates (not finite, or beyond 1e12); model space and rendered layouts together |
 | `model_blank` | bool | `dxf2pdf` (1.3) — `true` when the PDF holds only the paper-space layouts, no model page: model space has entities but none visible, or (1.4) nothing to draw at all (`page_size_mm` is then the first layout's) |
 | `warnings` | string[] | all — `[]` or e.g. `"raster_fallback_unavailable"`, `"layout_skipped:<name>"` |
 | `ms` | int | all — wall time since start |
@@ -227,6 +228,12 @@ paths or millions of hatch segments render 4–7 times faster.
   `get_drawings()` (~1.25 KB per path + 0.37 KB per segment, measured with PyMuPDF 1.26.7).
 - A hatch pattern that would produce more than 1 000 000 line segments is drawn as the hatch's
   outline (`simplified_hatches`); AutoCAD's HPMAXLINES has the same number but counts pattern lines.
+- A drawn part far from the rest of the drawing is left out (`far_parts`, 1.5): the drawing's core
+  is the box between the 1st and 99th percentile of the drawn parts' bounding boxes, and a part
+  reaching more than 1000 × the core's longer side beyond it — or with a coordinate that is not
+  finite or beyond 1e12 — is not drawn and does not count for the page size. Kept, such a part
+  shrinks the drawing to a dot; past 1e-9 fit scale ezdxf stops scaling and a coordinate above
+  3.4e38 made PyMuPDF fail (exit 5). Ordinary drawings are not touched.
 - Address space limited to 2 GB (`RLIMIT_AS`, Linux; macOS ignores it). Override with
   `CAD_ENGINE_MEMORY_MB` (0 disables).
 - BLAS/OpenMP thread pools are limited to one thread (OpenCV too: `cv2.setNumThreads(1)`).
