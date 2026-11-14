@@ -112,7 +112,7 @@ def trim_far_parts(recorder) -> FarTrim:
     far[measured] = far_mask(boxes[measured])
     dropped = int(far.sum())
     if dropped:
-        recorder.records = [r for r, f in zip(records, far) if not f]
+        recorder.records = [r for r, f in zip(records, far, strict=True) if not f]
     kept = measured & ~far
     if not kept.any():
         return FarTrim(dropped, None)

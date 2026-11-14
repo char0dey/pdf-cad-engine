@@ -15,6 +15,10 @@ size (A4 landscape when the layout has none); viewports show model space through
 clipping window. A layout whose viewports show an empty part of model space comes out as a
 blank sheet (as a CAD program would plot it). When model space has nothing to draw at all
 (1.4) but sheets have entities of their own, the PDF holds those sheets only (``model_blank``).
+
+An entity ezdxf raises on while measuring or drawing is left out and the rest is drawn (1.5.2,
+`cad_engine.entity_guard`); when nothing at all is left to draw, that is an engine failure (exit 5)
+with the first error, not an empty drawing.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ from __future__ import annotations
 import sys
 from typing import TYPE_CHECKING
 
-from cad_engine import outputs
+from cad_engine import entity_guard, outputs
 from cad_engine.budget import Budget, Ticker
 from cad_engine.dxfio import check_dxf_signature, extents_mm_factor, load_dxf
 from cad_engine.errors import EngineError, InputError
@@ -71,8 +75,6 @@ def check_not_empty(doc: Drawing, scan: ScanResult | None = None, *,
 
 
 def _model_extents(doc: Drawing, scan: ScanResult | None) -> tuple[float, float]:
-    from ezdxf import bbox
-
     code = empty_reason(scan)
     detail = EMPTY_MESSAGES[code]
     msp = doc.modelspace()
@@ -80,13 +82,23 @@ def _model_extents(doc: Drawing, scan: ScanResult | None) -> tuple[float, float]
         raise InputError(code, f"{detail} (no entities in model space)")
     if scan is not None and scan.model_nothing_to_draw and scan.ms_entities == len(msp):
         raise InputError(code, f"{detail} (only external references in model space)")
-    ext = bbox.extents(msp, fast=True)
+    ext = entity_guard.extents(msp)
     if not ext.has_data:
+        _fail_if_skipped("extents")
         raise InputError(code, f"{detail} (nothing to draw in model space)")
     w, h = float(ext.size.x), float(ext.size.y)
     if w <= 0 and h <= 0:
         raise InputError(code, f"{detail} (zero-size extents)")
     return w, h
+
+
+def _fail_if_skipped(stage: str) -> None:
+    """Nothing left to draw because ezdxf raised on the entities (1.5.2): our failure, not an
+    empty drawing."""
+    skipped = entity_guard.LOG.count(stage)
+    if skipped:
+        raise EngineError(f"nothing left to draw: ezdxf failed on {skipped} entity(ies) "
+                          f"({entity_guard.LOG.first_error()})")
 
 
 def drawn_viewports(layout: Layout) -> list:
@@ -126,10 +138,12 @@ def sheet_layouts(doc: Drawing) -> list[str]:
     other than a viewport, with extents. With an empty model space the viewports show nothing, so
     these are the pages of a sheets-only PDF; a layout with viewports alone would be a blank
     sheet and does not count (1.4)."""
-    from ezdxf import bbox
+    def has_extents(entity) -> bool:
+        ext = entity_guard.entity_extents(entity)
+        return ext is not None and ext.has_data
 
     def draws(layout: Layout) -> bool:  # stops at the first entity with extents
-        return any(e.dxftype() != "VIEWPORT" and bbox.extents((e,), fast=True).has_data for e in layout)
+        return any(e.dxftype() != "VIEWPORT" and has_extents(e) for e in layout)
 
     return [name for name, layout in _paper_spaces(doc) if draws(layout)]
 
@@ -170,7 +184,8 @@ def render_layout(doc: Drawing, layout, budget: Budget, colors: str = "color") -
     budget.check()
     far = backend.trim_far_parts()
     if far.dropped:
-        print(f"cad-engine: {far.dropped} drawn part(s) left out in {getattr(layout, 'name', '?')!r}: more than "
+        name = getattr(layout, "name", "?")
+        print(f"cad-engine: {far.dropped} drawn part(s) left out in {name!r}: more than "
               f"{FAR_RATIO:g}x the drawing's size away from it, or broken coordinates", file=sys.stderr)
     return backend
 
@@ -207,7 +222,6 @@ def _layout_pdf(doc: Drawing, name: str, budget: Budget,
     """One paper-space layout as a one-page PDF in its paper size, the simplified hatches and
     the parts left out as far from the sheet. A layout whose viewports look at an empty part
     of model space draws nothing: it becomes a blank sheet, as a CAD program would plot it."""
-    from ezdxf import bbox
     from ezdxf.addons.drawing import layout as page_layout
 
     paper = doc.layouts.get(name)
@@ -227,7 +241,7 @@ def _layout_pdf(doc: Drawing, name: str, budget: Budget,
     if far.dropped and far.size is not None:  # the sheet without its far parts (1.5)
         content = far.size
     else:
-        ext = bbox.extents(layout_content(paper), fast=True)
+        ext = entity_guard.extents(layout_content(paper))
         content = (float(ext.size.x), float(ext.size.y)) if ext.has_data else None
     if content is not None and inner_w > 0 and inner_h > 0:
         w, h = content
@@ -281,6 +295,7 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
     meta["dxf_version"] = doc.dxfversion
     meta["layouts"] = []
     extents = check_not_empty(doc, scan, sheets=layouts)
+    measured_with_skips = entity_guard.LOG.count("extents") > 0
     budget.check()
 
     if extents is None:
@@ -293,8 +308,10 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
         w, h = extents
         backend = render_modelspace(doc, budget, colors)
         budget.check()
-        if backend.far.dropped and backend.far.size is not None:
-            w, h = backend.far.size  # the page follows the drawing without its far parts (1.5)
+        if (backend.far.dropped or measured_with_skips) and backend.far.size is not None:
+            # the page follows what was drawn: without its far parts (1.5), or measured by the
+            # recording when ezdxf failed on entities while measuring the extents (1.5.2)
+            w, h = backend.far.size
         pw, ph = choose_page(page, w, h, entities, extents_mm_factor(doc))
         pdf_bytes = _model_pdf(backend, (pw, ph))
         simplified, far_parts = backend.simplified_hatches, backend.far.dropped
@@ -302,6 +319,7 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
         if pdf_bytes is None:
             # entities, but none visible (all on layers that are off or frozen …): the sheets, or a refusal
             if not names:
+                _fail_if_skipped("render")
                 code = empty_reason(scan)
                 raise InputError(code, f"{EMPTY_MESSAGES[code]} (nothing visible in model space)")
             print("cad-engine: model space draws nothing visible; the PDF holds the layouts only",
@@ -333,6 +351,7 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, page: str = "auto
         budget.check()
         if merged.page_count == 0:  # a blank model and every layout skipped
             merged.close()
+            _fail_if_skipped("render")
             code = empty_reason(scan)
             raise InputError(code, f"{EMPTY_MESSAGES[code]} (nothing visible in model space, "
                                    "no layout rendered)")

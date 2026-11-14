@@ -10,7 +10,7 @@ heavy to read at all (``too_complex``, `cad_engine.complexity`). An empty drawin
 
 from __future__ import annotations
 
-from cad_engine import outputs
+from cad_engine import entity_guard, outputs
 from cad_engine.budget import Budget
 from cad_engine.complexity import check_pdf_complexity
 from cad_engine.dxf2pdf import check_not_empty, paper_layouts, render_modelspace, sheet_layouts
@@ -117,12 +117,14 @@ def preview_dxf(src: str, dst: str, *, budget: Budget, meta: dict) -> None:
     meta["layers"] = len(doc.layers)
     meta["dxf_version"] = doc.dxfversion
     w, h = check_not_empty(doc)
+    measured_with_skips = entity_guard.LOG.count("extents") > 0
     budget.check()
     backend = render_modelspace(doc, budget)
     budget.check()
     meta["far_parts"] = backend.far.dropped
-    if backend.far.dropped and backend.far.size is not None:
-        w, h = backend.far.size  # the drawing without its far parts (1.5)
+    if (backend.far.dropped or measured_with_skips) and backend.far.size is not None:
+        # the drawing without its far parts (1.5), or as drawn when measuring skipped entities (1.5.2)
+        w, h = backend.far.size
     rendered = backend.get_replay(_preview_page(w, h), settings=layout.Settings(fit_page=True))
     page = rendered.page
     zoom = PREVIEW_LONGEST_PX / max(page.rect.width, page.rect.height)

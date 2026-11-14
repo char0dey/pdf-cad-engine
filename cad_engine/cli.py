@@ -24,7 +24,7 @@ import tempfile
 import time
 import traceback
 
-from cad_engine import __version__, outputs
+from cad_engine import __version__, entity_guard, outputs
 from cad_engine.budget import Budget
 from cad_engine.errors import (
     EXIT_BUDGET,
@@ -36,6 +36,7 @@ from cad_engine.errors import (
     EngineError,
     InputError,
     MemoryLimitExceeded,
+    looks_like_oom,
 )
 
 COMMANDS = ("pdf2dxf", "dxf2pdf", "probe-pdf", "probe-dxf", "preview-dxf")
@@ -46,7 +47,6 @@ PROBE_DXF_FLAGS = ("light",)
 DEFAULT_BUDGET_MS = 90_000
 DEFAULT_MEMORY_MB = 2048
 MEMORY_ENV = "CAD_ENGINE_MEMORY_MB"  # operational override of the address-space limit
-_OOM_MARKERS = ("malloc", "out of memory", "cannot allocate", "memory allocation")
 
 
 class UsageError(EngineError):
@@ -118,6 +118,8 @@ def new_meta() -> dict:
         "empty_reason": None,
         "simplified_hatches": None,
         "far_parts": None,
+        "skipped_entities": None,
+        "entity_errors": None,
         "model_blank": None,
         "warnings": [],
         "ms": None,
@@ -241,8 +243,7 @@ def _dispatch(args: argparse.Namespace, budget: Budget, meta: dict) -> None:
 
 
 def _is_oom(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    return any(marker in text for marker in _OOM_MARKERS)
+    return looks_like_oom(exc)
 
 
 def _fail(meta: dict, code: str, message: str) -> None:
@@ -253,6 +254,7 @@ def _fail(meta: dict, code: str, message: str) -> None:
 def _run(argv: list[str], started: float, meta: dict, state: dict) -> int:
     """Parse, set limits, run the command. Returns the exit code."""
     budget: Budget | None = None
+    entity_guard.clear()
     try:
         args = build_parser().parse_args(argv)
         state["args"] = args
@@ -288,6 +290,9 @@ def _run(argv: list[str], started: float, meta: dict, state: dict) -> int:
     finally:
         if budget is not None:
             budget.disarm()
+        if entity_guard.LOG.active:  # a DXF was loaded: what the safety net left out (1.5.2), failures too
+            meta["skipped_entities"] = entity_guard.LOG.count("render")
+            meta["entity_errors"] = entity_guard.LOG.to_meta()
 
 
 def _emit(stream, meta: dict, meta_path: str | None) -> None:

@@ -31,6 +31,9 @@ from ezdxf.addons.drawing import Frontend
 from ezdxf.addons.drawing.frontend import closed_loops, ignore_text_boxes
 from ezdxf.render import hatching
 
+from cad_engine import entity_guard
+from cad_engine.errors import looks_like_oom
+
 #: Most line segments one hatch pattern may produce before it is drawn as an outline.
 MAX_HATCH_SEGMENTS = 1_000_000
 #: A hatch estimated at this many times the cap is outlined without generating its pattern.
@@ -96,7 +99,8 @@ def estimate_segments(polygon, paths: Iterable) -> float:
 
 class EngineFrontend(Frontend):
     """ezdxf ``Frontend`` with a segment cap on hatch patterns; ``simplified_hatches`` counts
-    the hatches drawn as outlines."""
+    the hatches drawn as outlines. ``draw_entity`` carries the safety net (1.5.2,
+    `cad_engine.entity_guard`): an entity ezdxf raises on is left out, the rest is drawn."""
 
     def __init__(self, *args, max_hatch_segments: int | None = None,
                  tick: Callable[[], None] | None = None, **kwargs) -> None:
@@ -105,6 +109,31 @@ class EngineFrontend(Frontend):
         self.max_hatch_segments = max_hatch_segments or MAX_HATCH_SEGMENTS
         self.simplified_hatches = 0
         self._tick = tick
+
+    def draw_entity(self, entity, properties) -> None:
+        """``Frontend.draw_entity`` with the safety net. ezdxf calls it for every entity, the
+        virtual ones inside block references, dimensions … too, so an entity in a block is left out
+        on its own; at a block reference only a failure to explode it lands here (the reference
+        keeps what it drew before). What was drawn before the error stays: a composite would
+        otherwise lose all of it. The stacks a composite may leave open (block-reference state,
+        clipping) are restored."""
+        ctx = self.ctx
+        states = len(ctx._saved_states)
+        block_reference = ctx.current_block_reference_properties
+        portal = self.pipeline.clipping_portal
+        clipping = portal.stack_depth
+        try:
+            super().draw_entity(entity, properties)
+        except entity_guard.PASS_THROUGH:
+            raise
+        except Exception as exc:
+            if looks_like_oom(exc):
+                raise
+            del ctx._saved_states[states:]
+            ctx.current_block_reference_properties = block_reference
+            while portal.stack_depth > clipping:
+                portal.pop()
+            entity_guard.LOG.add("render", entity, exc)
 
     def draw_hatch_pattern(self, polygon, paths, properties) -> None:
         # ezdxf 1.4.5 Frontend.draw_hatch_pattern + the cap (and its timeout message on stderr:

@@ -21,7 +21,7 @@ META_KEYS = {
     "version", "command", "pages", "entities", "layers", "text_entities", "images", "has_vectors",
     "text_as_outlines", "traced_pages", "recognized", "scale", "units", "empty", "dxf_version",
     "page_size_mm", "layouts", "scanned", "missing", "ms_entities", "ms_drawable", "empty_reason",
-    "simplified_hatches", "model_blank", "far_parts",
+    "simplified_hatches", "model_blank", "far_parts", "skipped_entities", "entity_errors",
     "warnings", "ms", "code", "message",
 }
 
@@ -30,11 +30,11 @@ def test_version_isolated_mode():
     proc = subprocess.run([sys.executable, "-I", "-m", "cad_engine", "--version"], cwd=ENGINE_DIR,
                           capture_output=True, text=True, timeout=60)
     assert proc.returncode == 0
-    assert proc.stdout == "1.5.1\n"
+    assert proc.stdout == "1.5.2\n"
 
 
 def test_version_matches_package_metadata():
-    assert cad_engine.__version__ == "1.5.1"
+    assert cad_engine.__version__ == "1.5.2"
     assert version("pdf-cad-engine") == cad_engine.__version__
 
 
@@ -44,7 +44,7 @@ def test_stdout_is_exactly_one_json_line(sample_plan_pdf, tmp_path):
     assert run.stdout.count("\n") == 1 and run.stdout.endswith("\n")
     meta = json.loads(run.stdout)
     assert set(meta) == META_KEYS
-    assert meta["version"] == "1.5.1"
+    assert meta["version"] == "1.5.2"
     assert meta["command"] == "pdf2dxf"
     assert meta["code"] is None and meta["message"] is None
     assert isinstance(meta["ms"], int) and meta["ms"] >= 0

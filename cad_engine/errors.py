@@ -10,6 +10,16 @@ EXIT_BUDGET = 3
 EXIT_MEMORY = 4
 EXIT_FAILURE = 5
 
+#: Libraries out of memory under the address-space limit often raise something else than
+#: ``MemoryError`` (MuPDF, numpy …); their message says it.
+OOM_MARKERS = ("malloc", "out of memory", "cannot allocate", "memory allocation")
+
+
+def looks_like_oom(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in OOM_MARKERS)
+
+
 #: ``code`` values reported with exit code 2 (unusable input).
 INPUT_ERROR_CODES = frozenset(
     {

@@ -172,6 +172,8 @@ All keys are always present; `null` when not applicable to the command.
 | `layouts` | string[] | `dxf2pdf` — paper-space layouts rendered as extra pages (`[]` without `--layouts`); `probe-dxf` — paper-space layouts with content (1.4: with an empty model space, the sheets the PDF will hold) |
 | `simplified_hatches` | int | `dxf2pdf` (1.3) — hatches drawn as their outline because the pattern would produce more than 1 000 000 line segments (model space and rendered layouts, each insert counted) |
 | `far_parts` | int | `dxf2pdf`, `preview-dxf` (1.5) — drawn parts left out because they lie more than 1000 times the drawing's size away from it, or have broken coordinates (not finite, or beyond 1e12); model space and rendered layouts together |
+| `skipped_entities` | int | DXF commands that loaded the drawing (1.5.2) — entities left out of the drawing because ezdxf raised on them while rendering (an entity seen through two viewports counts twice); `probe-dxf` does not render: 0 |
+| `entity_errors` | object[] \| null | DXF commands that loaded the drawing (1.5.2) — up to 10 different errors the safety net caught, the most frequent first: `{"stage": "extents" \| "render", "type": "SPLINE", "error": "ValueError: invalid order", "where": "ezdxf/acc/bspline.pyx:72 < …", "count": 38}` (`where`: the three innermost traceback frames); also on failure (exit 5) |
 | `model_blank` | bool | `dxf2pdf` (1.3) — `true` when the PDF holds only the paper-space layouts, no model page: model space has entities but none visible, or (1.4) nothing to draw at all (`page_size_mm` is then the first layout's) |
 | `warnings` | string[] | all — `[]` or e.g. `"raster_fallback_unavailable"`, `"layout_skipped:<name>"` |
 | `ms` | int | all — wall time since start |
@@ -217,6 +219,17 @@ ezdxf bugs that real drawings hit are fixed in the engine process (`cad_engine/e
 installed by `load_dxf`, only for the pinned ezdxf 1.4.5): since 1.5.1 a leader (MULTILEADER)
 whose landing has length 0 is transformed without dividing by zero — ezdxf transforms it whenever a
 block is exploded, so one such leader in an inserted block used to fail the whole drawing (exit 5).
+Since 1.5.2 B-splines of degree 11 and up (AutoCAD allows up to 25) go to ezdxf's own pure-Python
+B-spline code: its C extension takes orders below 12 only and refused such a spline with
+`ValueError: invalid order`, failing the whole drawing (exit 5).
+A safety net (1.5.2, `cad_engine/entity_guard.py`) keeps one entity ezdxf raises on from failing the
+drawing: measuring the extents (model, sheets) tries the whole set first and, only when that raises,
+entity by entity; rendering catches the error per entity in the frontend's `draw_entity`, which runs
+for the entities inside block references too, so an entity in a block is left out on its own. What
+was left out is in the meta (`skipped_entities`, `entity_errors`) and on stderr (one line per new
+error). Engine errors, `MemoryError`, out-of-memory errors of the libraries and the time budget pass
+through; when nothing at all is left to draw, that is exit 5 with the first error, not
+`empty_drawing`.
 The recording is written to PDF by `cad_engine/pdf_backend.py` (1.2), a subclass of ezdxf's
 PyMuPDF backend with the same output (paths, colours, widths, one PDF layer per drawing
 layer) but linear time: the page content goes into a new content stream every 500 paths

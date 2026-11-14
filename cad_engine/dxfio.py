@@ -103,12 +103,14 @@ def drop_broken_block_refs(doc: Drawing) -> int:
 def load_dxf(path: str) -> Drawing:
     """Load a DXF (ASCII or binary); damaged files go through ezdxf.recover. Block references that
     point at no block are dropped either way (``drop_broken_block_refs``). The engine's ezdxf fixes
-    (``ezdxf_fixes``) are installed here, before anything reads the drawing."""
+    (``ezdxf_fixes``) are installed here, before anything reads the drawing, and the safety net's
+    log (``entity_guard``) starts afresh for this drawing."""
     import ezdxf
 
-    from cad_engine import ezdxf_fixes
+    from cad_engine import entity_guard, ezdxf_fixes
 
     ezdxf_fixes.apply()
+    entity_guard.reset()
     kind = check_dxf_signature(path)
     try:
         doc = ezdxf.readfile(path)
