@@ -82,3 +82,51 @@ def test_dense_page_is_refused_by_the_cli(dense_pdf, tmp_path, command):
     assert run.meta["code"] == "too_complex"
     assert time.perf_counter() - started < 10
     assert not (tmp_path / "out.dxf").exists()
+
+
+# -- engine 1.6: the cost of the whole PDF ---------------------------------------------------
+def test_pdf_costs_is_the_sum_of_page_costs(gen):
+    import pymupdf
+
+    from cad_engine.complexity import pdf_costs, total_cost
+
+    path = make_sample.build_heavy_pdf(gen / "three_pages.pdf", 30_000, kind="outlines", pages=3)
+    with pymupdf.open(path) as doc:
+        costs = pdf_costs(doc)
+        assert costs == [page_cost(doc, doc[pno]) for pno in range(3)]
+        assert all(c.paths > 0 for c in costs)
+        assert check_pdf_complexity(doc) == costs  # the check returns the same pass
+    total = total_cost(costs)
+    assert total.paths == sum(c.paths for c in costs)
+    assert total.segments == sum(c.segments for c in costs)
+
+
+def test_nested_forms_drawn_several_times(gen):
+    # the page draws F0 twice; F0 draws 10 lines and F1 three times; F1 draws 5 lines
+    cost = _cost(make_sample.build_nested_forms_pdf(gen / "nested_forms.pdf"))
+    assert (cost.paths, cost.segments) == (2 * (10 + 3 * 5), 2 * (10 + 3 * 5))
+
+
+def test_check_counts_pages_until_the_refusal(gen, dense_pdf):
+    import pymupdf
+
+    from cad_engine.complexity import pdf_costs
+
+    light = make_sample.build_heavy_pdf(gen / "light_two_pages.pdf", 2_000, kind="lines", pages=2)
+    with pymupdf.open(light) as doc:
+        assert len(check_pdf_complexity(doc)) == 2
+    with pymupdf.open(dense_pdf) as doc:
+        assert pdf_costs(doc)[0].bytes > MAX_PAGE_BYTES  # counting alone does not refuse
+
+
+@pytest.mark.parametrize("kind", ["outlines", "lines"])
+@pytest.mark.parametrize("units", [100_000, 500_000, 1_000_000])
+def test_heavy_generator_hits_the_target(gen, kind, units):
+    import pymupdf
+
+    from cad_engine.complexity import pdf_costs, total_cost
+
+    path = make_sample.build_heavy_pdf(gen / f"heavy_{kind}_{units}.pdf", units, kind=kind)
+    with pymupdf.open(path) as doc:
+        total = total_cost(pdf_costs(doc))
+    assert abs(total.paths + total.segments - units) <= units * 0.02

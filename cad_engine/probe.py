@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from cad_engine import entity_guard, outputs
 from cad_engine.budget import Budget
-from cad_engine.complexity import check_pdf_complexity
+from cad_engine.complexity import check_pdf_complexity, total_cost
 from cad_engine.dxf2pdf import check_not_empty, paper_layouts, render_modelspace, sheet_layouts
 from cad_engine.dxfio import check_dxf_signature, load_dxf
 from cad_engine.errors import EngineError, InputError
@@ -20,6 +20,9 @@ from cad_engine.pdf2dxf import clean_text, open_pdf, text_flags, visible
 from cad_engine.scan import apply_to_meta, empty_reason, safe_scan
 
 PROBE_PDF_PAGES = 5
+#: A page with at least this many paths is not read with ``get_drawings()`` (~75 µs a path, 11 s
+#: on the PROD 2026-11-16 page): it draws, and its count is known from the content (engine 1.6).
+PROBE_FULL_READ_MAX_PATHS = 20_000
 PREVIEW_LONGEST_PX = 1400
 PREVIEW_MARGIN_MM = 5.0
 PREVIEW_LONG_SIDE_MM = 297.0  # an A4-like sheet; the raster is scaled to PREVIEW_LONGEST_PX
@@ -27,10 +30,17 @@ PREVIEW_MIN_SHORT_SIDE_MM = 40.0
 
 
 def probe_pdf(src: str, *, budget: Budget, meta: dict) -> None:
+    """Facts about a PDF. ``vector_paths`` / ``vector_segments`` (engine 1.6) are the sum over all
+    pages of what ``pdf2dxf`` will read — the service decides by them whether the conversion
+    goes to the background. They are written before the slower reads below, so a run that
+    spends its budget later still reports them."""
     pdf = open_pdf(src)
     meta["pages"] = pdf.page_count
     # before any get_drawings(): past the memory limit it crashes instead of raising
-    check_pdf_complexity(pdf, budget=budget)
+    costs = check_pdf_complexity(pdf, budget=budget)
+    total = total_cost(costs)
+    meta["vector_paths"] = total.paths
+    meta["vector_segments"] = total.segments
     flags = text_flags()
     has_drawings = False
     texts = 0
@@ -48,11 +58,14 @@ def probe_pdf(src: str, *, budget: Budget, meta: dict) -> None:
         images += len(page.get_images())
         if not has_drawings:
             budget.check()
-            has_drawings = any(
-                visible(d.get("color"), d.get("stroke_opacity"))
-                or visible(d.get("fill"), d.get("fill_opacity"))
-                for d in page.get_drawings()
-            )
+            if costs[pno].paths >= PROBE_FULL_READ_MAX_PATHS:
+                has_drawings = True  # a page this heavy draws something; reading it would take seconds
+            else:
+                has_drawings = any(
+                    visible(d.get("color"), d.get("stroke_opacity"))
+                    or visible(d.get("fill"), d.get("fill_opacity"))
+                    for d in page.get_drawings()
+                )
     meta["text_entities"] = texts
     meta["images"] = images
     meta["has_vectors"] = has_drawings or texts > 0

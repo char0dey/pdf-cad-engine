@@ -812,6 +812,89 @@ def build_dense_lines_pdf(out: Path, lines: int, *, form_calls: int = 0, noise: 
     return _raw_pdf(out, objects)
 
 
+#: Paths (``get_drawings()`` entries) + segments of one generated path, per kind (engine 1.6):
+#: a glyph outline is 5 segments (curves and lines), a line is one segment.
+HEAVY_UNITS_PER_PATH = {"outlines": 1 + 5, "lines": 1 + 1}
+
+
+def _heavy_page(n: int, kind: str, rnd) -> bytes:
+    """``n`` paths on an A3 landscape page, one per grid cell (text-like rows)."""
+    import math
+
+    cols = max(1, math.ceil(math.sqrt(n * 1190 / 842)))
+    rows = max(1, math.ceil(n / cols))
+    cw, ch = 1190 / cols, 842 / rows
+    parts = [b"0.1 w 0 g 0 G\n"]
+
+    def pt(x0: float, y0: float, fx: float, fy: float, jitter: float = 0.08) -> bytes:
+        """A point in the cell at (x0, y0), a little off the grid."""
+        return b"%.2f %.2f" % (x0 + cw * min(max(fx + rnd.uniform(-jitter, jitter), 0.0), 1.0),
+                               y0 + ch * min(max(fy + rnd.uniform(-jitter, jitter), 0.0), 1.0))
+
+    for i in range(n):
+        x0, y0 = (i % cols) * cw, (i // cols) * ch
+        if kind == "outlines":
+            # a glyph filled and stroked (B), irregular curves (no arcs to recognise); two shapes in
+            # turn: curve runs broken by lines (4 entities) and one curve run (2 entities), ~3 per
+            # path as on the PROD 2026-11-16 page (406 629 entities from 147 895 paths)
+            start = pt(x0, y0, 0.2, 0.1, 0.0)
+            c1 = pt(x0, y0, 0.5, 0.0) + b" " + pt(x0, y0, 0.8, 0.05) + b" " + pt(x0, y0, 0.85, 0.3) + b" c "
+            c2 = pt(x0, y0, 0.95, 0.55) + b" " + pt(x0, y0, 0.85, 0.8) + b" " + pt(x0, y0, 0.6, 0.9) + b" c "
+            c3 = pt(x0, y0, 0.4, 0.95) + b" " + pt(x0, y0, 0.15, 0.85) + b" " + pt(x0, y0, 0.15, 0.6) + b" c "
+            if i % 2 == 0:
+                body = c1 + c2 + pt(x0, y0, 0.3, 0.7) + b" l " + c3 + start + b" l "
+            else:
+                c4 = (pt(x0, y0, 0.05, 0.45) + b" " + pt(x0, y0, 0.25, 0.3) + b" "
+                      + pt(x0, y0, 0.3, 0.25) + b" c ")
+                body = c1 + c2 + c3 + c4 + start + b" l "
+            parts.append(start + b" m " + body + b"h B\n")
+        else:
+            # one line per path, as CAD exporters write linework (the PROD 2026-11-10 pattern)
+            parts.append(pt(x0, y0, 0.1, 0.1, 0.1) + b" m " + pt(x0, y0, 0.9, 0.9, 0.1) + b" l S\n")
+    return b"".join(parts)
+
+
+def build_heavy_pdf(out: Path, units: int, *, kind: str = "outlines", pages: int = 1, seed: int = 7) -> Path:
+    """Engine 1.6 calibration input: A3 pages with about ``units`` paths + segments in all
+    (``complexity.pdf_costs``), spread evenly over ``pages``. ``kind``: ``"outlines"`` — text
+    converted to curves (the PROD 2026-11-16 page: filled glyph outlines of Bézier curves),
+    ``"lines"`` — line drawing (one line per path). Synthetic only, no customer data; stdlib
+    only, so a million units take seconds."""
+    import random
+
+    if kind not in HEAVY_UNITS_PER_PATH:
+        raise ValueError(f"kind must be one of {sorted(HEAVY_UNITS_PER_PATH)}")
+    paths = max(pages, round(units / HEAVY_UNITS_PER_PATH[kind]))
+    rnd = random.Random(seed)
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>"]
+    kids = b" ".join(b"%d 0 R" % (3 + 2 * i) for i in range(pages))
+    objects.append(b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, pages))
+    for i in range(pages):
+        n = paths // pages + (1 if i < paths % pages else 0)
+        page = b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1190 842] /Contents %d 0 R >>"
+        objects.append(page % (4 + 2 * i))
+        objects.append(_stream(_heavy_page(n, kind, rnd)))
+    return _raw_pdf(out, objects)
+
+
+def build_nested_forms_pdf(out: Path, *, page_calls: int = 2, inner_calls: int = 3, outer_lines: int = 10,
+                           inner_lines: int = 5) -> Path:
+    """A page drawing form F0 ``page_calls`` times; F0 draws ``outer_lines`` lines and form F1
+    ``inner_calls`` times; F1 draws ``inner_lines`` lines (engine 1.6: nested forms in the sum)."""
+    bbox = b"/Type /XObject /Subtype /Form /BBox [0 0 1190 842] "
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 1190 842] /Contents 4 0 R"
+        b" /Resources << /XObject << /F0 5 0 R >> >> >>",
+        _stream(b"q /F0 Do Q\n" * page_calls),
+        _stream(_lines(outer_lines) + b"q /F1 Do Q\n" * inner_calls,
+                bbox + b"/Resources << /XObject << /F1 6 0 R >> >> "),
+        _stream(_lines(inner_lines, seed=8), bbox),
+    ]
+    return _raw_pdf(out, objects)
+
+
 def build_dense_hatch_dxf(out: Path, *, pattern: str = "AR-CONC", scale: float = 0.005, width: float = 8000.0,
                           height: float = 2000.0, inserts: int = 0, paper: bool = False,
                           lines: int = 300) -> Path:

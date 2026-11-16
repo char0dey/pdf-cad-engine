@@ -103,6 +103,8 @@ def new_meta() -> dict:
         "images": None,
         "has_vectors": None,
         "text_as_outlines": None,
+        "vector_paths": None,
+        "vector_segments": None,
         "traced_pages": None,
         "recognized": None,
         "scale": None,

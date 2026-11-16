@@ -38,7 +38,7 @@ cad-engine ...                             # console script, same arguments
 |---------------|-------|-------------------|-------|
 | `pdf2dxf`     | PDF   | DXF (R2010, mm)   | `--preview out.png`: PNG of the extracted geometry |
 | `dxf2pdf`     | DXF   | PDF (1 page; + layouts) | ASCII or binary DXF; damaged files are recovered |
-| `probe-pdf`   | PDF   | —                 | pages, `has_vectors` / `text_entities` on the first 5 pages |
+| `probe-pdf`   | PDF   | —                 | pages, `vector_paths` / `vector_segments` of all pages (1.6), `has_vectors` / `text_entities` on the first 5 pages |
 | `probe-dxf`   | DXF   | —                 | `entities`, `empty` / `empty_reason`, `dxf_version`, `layers`, `layouts`, the content scan; `--light`: the scan only |
 | `preview-dxf` | DXF   | PNG               | model space, longest side 1400 px, white background |
 
@@ -158,6 +158,7 @@ All keys are always present; `null` when not applicable to the command.
 | `images` | int | `pdf2dxf`, `probe-pdf` — embedded images (ignored by the conversion) |
 | `has_vectors` | bool | `pdf2dxf`, `probe-pdf` |
 | `text_as_outlines` | bool | `pdf2dxf`, `probe-pdf` — no real text but vector drawings (text is glyph outlines) |
+| `vector_paths` / `vector_segments` | int | `probe-pdf` (1.6) — paths (painting operators) and segments (`l c v y re`) of all pages, forms counted once per time drawn (`cad_engine/complexity.py`). The work `pdf2dxf` does grows with their sum: the service sends a PDF whose sum is over its threshold to the background. Written before the text and drawings are read, so also present in the meta of a run that spent its budget (exit 3) |
 | `traced_pages` | int[] | `pdf2dxf` — 0-based pages traced by `--raster-fallback` (`[]` otherwise) |
 | `recognized` | object | `pdf2dxf` — `{"circles", "arcs", "hatches", "linetypes", "merged"}` counts (all 0 with the flags off): CIRCLE / ARC / HATCH entities written, entities given a DASHED/DOT linetype, entities saved by `--merge` (joined pieces + dropped duplicates) |
 | `scale` | string | `pdf2dxf` — `asis`, `1-50`, `1-100`, `1-200` |
@@ -243,6 +244,9 @@ paths or millions of hatch segments render 4–7 times faster.
 - 50 PDF pages, 500 000 DXF entities, default budget 90 s.
 - A PDF page is refused (`too_complex`) when its paths would take more than ~1.2 GB in
   `get_drawings()` (~1.25 KB per path + 0.37 KB per segment, measured with PyMuPDF 1.26.7).
+- `probe-pdf` does not read a page of 20 000 paths or more with `get_drawings()` (1.6,
+  `PROBE_FULL_READ_MAX_PATHS`; ~75 µs a path, 11 s on a page of 148 000 glyph outlines): such a page
+  counts as drawing something (`has_vectors`), so the probe of a heavy page stays within its budget.
 - A hatch pattern that would produce more than 1 000 000 line segments is drawn as the hatch's
   outline (`simplified_hatches`); AutoCAD's HPMAXLINES has the same number but counts pattern lines.
 - A drawn part far from the rest of the drawing is left out (`far_parts`, 1.5): the drawing's core
@@ -267,7 +271,10 @@ paths or millions of hatch segments render 4–7 times faster.
 .venv/bin/ruff check .
 ```
 
-Inputs are generated at session start (`tests/make_sample.py`) into pytest's temp dir. `tests/test_pdf_backend.py` renders the same drawings with
+Inputs are generated at session start (`tests/make_sample.py`) into pytest's temp dir.
+`scripts/make_heavy_pdf.py OUT.pdf UNITS [--kind outlines|lines] [--pages N]` (1.6) writes a synthetic
+heavy PDF of about `UNITS` paths + segments — text as glyph outlines or one-line-per-path linework —
+for calibrating the service's background threshold and the memory limit on a server. `tests/test_pdf_backend.py` renders the same drawings with
 ezdxf's stock PyMuPDF backend and compares pages pixel by pixel, the PDF layers and the timing.
 Optional large samples (`floorplan.dxf`, `Ceco.NET-Architecture-Tm-53.dxf`) are read from
 `$CAD_ENGINE_SAMPLES_DIR`; tests that need them are skipped otherwise. Exit codes 3/4/5

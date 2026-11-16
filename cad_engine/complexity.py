@@ -19,6 +19,10 @@ Literal and hex strings, comments and inline images are cut out first, so their 
 mistaken for operators. ``n`` (end a clipping path without painting) is not counted: such paths
 are not drawings.
 
+Since engine 1.6 the sum over all pages (paths + segments) is also reported by ``probe-pdf``
+(``vector_paths`` / ``vector_segments``): the service sends a PDF whose conversion would not fit
+the synchronous time budget to the background queue by it.
+
 Memory of ``get_drawings()`` measured on the servers (PyMuPDF 1.26.7, 2026-11-10): about
 1.25 KB per path plus 0.37 KB per segment (100k / 200k / 400k one-segment paths: +164 / +326 /
 +648 MB; 400k / 1.6M segments in ten paths: +149 / +587 MB).
@@ -135,16 +139,35 @@ def page_cost(doc, page) -> PageCost:
     return total
 
 
-def check_pdf_complexity(doc, *, budget=None, max_bytes: int = MAX_PAGE_BYTES) -> None:
-    """Refuse the PDF (``too_complex``) when any page would take more than ``max_bytes`` in
-    ``get_drawings()``."""
+def iter_page_costs(doc, budget=None):
+    """``page_cost`` of every page in order, checking the budget before each page."""
     for pno in range(doc.page_count):
         if budget is not None:
             budget.check()
-        cost = page_cost(doc, doc[pno])
+        yield page_cost(doc, doc[pno])
+
+
+def pdf_costs(doc, budget=None) -> list[PageCost]:
+    """``page_cost`` of every page: one pass over the PDF (engine 1.6)."""
+    return list(iter_page_costs(doc, budget))
+
+
+def total_cost(costs: list[PageCost]) -> PageCost:
+    """The whole PDF: the work ``pdf2dxf`` does grows with the sum over its pages (engine 1.6)."""
+    return sum(costs, PageCost(0, 0))
+
+
+def check_pdf_complexity(doc, *, budget=None, max_bytes: int = MAX_PAGE_BYTES) -> list[PageCost]:
+    """Refuse the PDF (``too_complex``) when any page would take more than ``max_bytes`` in
+    ``get_drawings()``; otherwise return the cost of every page (``pdf_costs``), so the caller
+    does not count again. The refusal comes at the first such page, before the rest is counted."""
+    costs: list[PageCost] = []
+    for pno, cost in enumerate(iter_page_costs(doc, budget)):
         if cost.bytes > max_bytes:
             raise InputError(
                 "too_complex",
                 f"page {pno + 1} is too complex to convert: about {cost.paths} paths and "
                 f"{cost.segments} segments (limit ~{max_bytes // (1024 * 1024)} MB of drawing data per page)",
             )
+        costs.append(cost)
+    return costs

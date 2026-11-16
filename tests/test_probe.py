@@ -138,3 +138,80 @@ def test_probe_rejects_conversion_options(sample_plan_dxf, scan_pdf):
     assert run.returncode == 5
     run = run_engine("probe-pdf", "--in", scan_pdf, "--raster-fallback")
     assert run.returncode == 5
+
+
+# -- engine 1.6: the PDF's cost in the meta, heavy pages not read ---------------------------
+def test_probe_pdf_heavy_page_fits_the_budget(gen):
+    import time
+
+    import make_sample
+
+    # 150 000 glyph outlines on one A3 page (the PROD 2026-11-16 pattern: text as curves)
+    path = make_sample.build_heavy_pdf(gen / "probe_heavy.pdf", 150_000 * 6, kind="outlines")
+    started = time.perf_counter()
+    run = run_engine("probe-pdf", "--in", path, "--budget-ms", 10000)
+    assert run.returncode == 0, run.stderr
+    assert time.perf_counter() - started < 10
+    assert run.meta["has_vectors"] is True
+    assert run.meta["text_as_outlines"] is True
+    assert run.meta["vector_paths"] == 150_000
+    assert run.meta["vector_segments"] == 150_000 * 5
+
+
+def test_probe_pdf_reports_the_cost_when_the_budget_runs_out_later(gen):
+    import pytest
+
+    from cad_engine.errors import BudgetExceeded
+    from cad_engine.probe import probe_pdf
+
+    import make_sample
+
+    class SpentAfterCounting:
+        """The budget runs out right after the cost of the page is counted."""
+
+        def __init__(self, pages: int) -> None:
+            self.calls = 0
+            self.pages = pages
+
+        def check(self) -> None:
+            self.calls += 1
+            if self.calls > self.pages:
+                raise BudgetExceeded("time budget of 1 ms exceeded")
+
+    path = make_sample.build_heavy_pdf(gen / "probe_spent.pdf", 60_000, kind="lines")
+    meta: dict = {}
+    with pytest.raises(BudgetExceeded):
+        probe_pdf(str(path), budget=SpentAfterCounting(1), meta=meta)
+    assert (meta["vector_paths"], meta["vector_segments"]) == (30_000, 30_000)
+    assert "has_vectors" not in meta
+
+
+def test_probe_pdf_reads_an_ordinary_plan(sample_plan_pdf, monkeypatch):
+    from cad_engine.budget import Budget
+    from cad_engine.probe import probe_pdf
+
+    calls = []
+    original = pymupdf.Page.get_drawings
+
+    def counting(self, *args, **kwargs):
+        calls.append(self.number)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(pymupdf.Page, "get_drawings", counting)
+    meta: dict = {}
+    probe_pdf(str(sample_plan_pdf), budget=Budget(10000), meta=meta)
+    assert calls == [0]
+    assert meta["has_vectors"] is True and meta["text_as_outlines"] is True
+    assert 0 < meta["vector_paths"] <= meta["vector_segments"]
+
+
+def test_probe_pdf_scan_cost(scan_pdf):
+    run = run_engine("probe-pdf", "--in", scan_pdf)
+    assert run.returncode == 0
+    assert run.meta["has_vectors"] is False
+    assert run.meta["vector_paths"] == 0 and run.meta["vector_segments"] == 0
+
+
+def test_probe_dxf_has_no_pdf_cost(sample_plan_dxf):
+    run = run_engine("probe-dxf", "--in", sample_plan_dxf)
+    assert run.meta["vector_paths"] is None and run.meta["vector_segments"] is None
