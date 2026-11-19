@@ -16,7 +16,15 @@ from cad_engine.complexity import check_pdf_complexity, total_cost
 from cad_engine.dxf2pdf import check_not_empty, paper_layouts, render_modelspace, sheet_layouts
 from cad_engine.dxfio import check_dxf_signature, load_dxf
 from cad_engine.errors import EngineError, InputError
-from cad_engine.pdf2dxf import clean_text, open_pdf, text_flags, visible
+from cad_engine.pdf2dxf import (
+    BACKGROUND_AREA_RATIO,
+    clean_text,
+    is_white,
+    open_pdf,
+    rgb_of,
+    text_flags,
+    visible,
+)
 from cad_engine.scan import apply_to_meta, empty_reason, safe_scan
 
 PROBE_PDF_PAGES = 5
@@ -29,11 +37,24 @@ PREVIEW_LONG_SIDE_MM = 297.0  # an A4-like sheet; the raster is scaled to PREVIE
 PREVIEW_MIN_SHORT_SIDE_MM = 40.0
 
 
+def _is_paper(drawing: dict, page_area: float) -> bool:
+    rect = drawing.get("rect")
+    return (rect is not None and is_white(rgb_of(drawing.get("fill")))
+            and abs(rect.width * rect.height) >= BACKGROUND_AREA_RATIO * page_area)
+
+
 def probe_pdf(src: str, *, budget: Budget, meta: dict) -> None:
     """Facts about a PDF. ``vector_paths`` / ``vector_segments`` (engine 1.6) are the sum over all
     pages of what ``pdf2dxf`` will read — the service decides by them whether the conversion
     goes to the background. They are written before the slower reads below, so a run that
-    spends its budget later still reports them."""
+    spends its budget later still reports them.
+
+    ``suggested_purpose`` (engine 1.7) is ``"cut"`` for a PDF that is only fills — a logo, a
+    lettering in curves: at most `PROBE_PDF_PAGES` pages, none too heavy to read, at least one
+    visible fill without stroke (the paper does not count), no stroke, no real text, no image;
+    otherwise ``"cad"``. ``fill_paths`` / ``stroke_paths`` are counted on the pages read while
+    the answer is open: the first stroke, text or image settles it and the rest is not read
+    (a drawing costs no more than before). Written last: a run out of budget leaves it null."""
     pdf = open_pdf(src)
     meta["pages"] = pdf.page_count
     # before any get_drawings(): past the memory limit it crashes instead of raising
@@ -45,6 +66,9 @@ def probe_pdf(src: str, *, budget: Budget, meta: dict) -> None:
     has_drawings = False
     texts = 0
     images = 0
+    fill_paths = 0
+    stroke_paths = 0
+    heavy = False
     for pno in range(min(pdf.page_count, PROBE_PDF_PAGES)):
         budget.check()
         page = pdf[pno]
@@ -56,20 +80,39 @@ def probe_pdf(src: str, *, budget: Budget, meta: dict) -> None:
                     if span.get("alpha", 255) != 0 and span.get("size", 0) > 0 and clean_text(span["text"]):
                         texts += 1
         images += len(page.get_images())
-        if not has_drawings:
-            budget.check()
-            if costs[pno].paths >= PROBE_FULL_READ_MAX_PATHS:
-                has_drawings = True  # a page this heavy draws something; reading it would take seconds
-            else:
-                has_drawings = any(
-                    visible(d.get("color"), d.get("stroke_opacity"))
-                    or visible(d.get("fill"), d.get("fill_opacity"))
-                    for d in page.get_drawings()
-                )
+        budget.check()
+        if costs[pno].paths >= PROBE_FULL_READ_MAX_PATHS:
+            has_drawings = True  # a page this heavy draws something; reading it would take seconds
+            heavy = True
+            continue
+        if not heavy and texts == 0 and images == 0 and stroke_paths == 0:
+            # only fills so far: read every path of the page (a logo takes milliseconds)
+            area = abs(page.rect.width * page.rect.height)
+            for d in page.get_drawings():
+                if visible(d.get("color"), d.get("stroke_opacity")):
+                    has_drawings = True
+                    stroke_paths += 1
+                    break  # the answer is "cad"
+                if visible(d.get("fill"), d.get("fill_opacity")):
+                    has_drawings = True
+                    if not _is_paper(d, area):
+                        fill_paths += 1
+        elif not has_drawings:
+            has_drawings = any(
+                visible(d.get("color"), d.get("stroke_opacity"))
+                or visible(d.get("fill"), d.get("fill_opacity"))
+                for d in page.get_drawings()
+            )
     meta["text_entities"] = texts
     meta["images"] = images
     meta["has_vectors"] = has_drawings or texts > 0
     meta["text_as_outlines"] = has_drawings and texts == 0
+    meta["fill_paths"] = fill_paths
+    meta["stroke_paths"] = stroke_paths
+    only_fills = fill_paths > 0 and stroke_paths == 0 and texts == 0 and images == 0
+    meta["suggested_purpose"] = (
+        "cut" if only_fills and not heavy and pdf.page_count <= PROBE_PDF_PAGES else "cad"
+    )
 
 
 def probe_dxf(src: str, *, budget: Budget, meta: dict, light: bool = False) -> None:

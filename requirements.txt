@@ -4,6 +4,8 @@ ezdxf==1.4.5
 pymupdf==1.26.7
 Pillow==12.3.0
 numpy==2.5.4
+# fill regions and --cut contours (engine 1.7); wheel manylinux_2_28 x86_64 for cp312
+shapely==2.2.0
 # Optional extra [raster] (pdf2dxf --raster-fallback): installed on the servers.
 opencv-python-headless==4.14.0.94
 # Transitive dependencies of ezdxf, pinned for reproducible installs.

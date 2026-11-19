@@ -115,19 +115,23 @@ def test_bezier_arc_tolerance():
 # -- --hatch-fills -----------------------------------------------------------------------------
 def test_hatch_fills(fills_pdf, tmp_path):
     meta, doc = convert_ok(fills_pdf, tmp_path, "--hatch-fills")
+    # контури заливок, 1.7.0: one HATCH per polygon of the painted area (the red rectangle and
+    # circle do not touch: two), polyline boundaries only, plus an outline per subpath
     red = of_type(doc, "HATCH", "FILL_FF0000")
-    assert len(red) == 1
-    hatch = red[0]
-    assert hatch.dxf.solid_fill == 1 and hatch.dxf.pattern_name == "SOLID"
-    assert hatch.dxf.color == 256  # BYLAYER: the layer keeps the fill colour
+    assert len(red) == 2
+    for hatch in red:
+        assert hatch.dxf.solid_fill == 1 and hatch.dxf.pattern_name == "SOLID"
+        assert hatch.dxf.color == 256  # BYLAYER: the layer keeps the fill colour
+        assert [type(p).__name__ for p in hatch.paths] == ["PolylinePath"]
     assert doc.layers.get("FILL_FF0000").rgb == (255, 0, 0)
-    assert [type(p).__name__ for p in hatch.paths] == ["PolylinePath", "EdgePath"]  # rectangle, circle
-    assert {e.type.name for e in hatch.paths[1].edges} == {"SPLINE"}
+    assert doc.layers.get("OUTLINE_FF0000").rgb == (255, 0, 0)
     blue = of_type(doc, "HATCH", "FILL_0000FF")  # even-odd square with a hole: two loops
     assert len(blue) == 1 and len(blue[0].paths) == 2
-    # fill + stroke stays an outline, no closed polylines on FILL layers
-    assert [e.dxf.layer for e in of_type(doc, "LWPOLYLINE")] == ["LINES_000000"]
-    assert meta["recognized"]["hatches"] == 2
+    # fill + stroke stays an outline; fills are outlined on OUTLINE layers, none on FILL layers
+    assert sorted(e.dxf.layer for e in of_type(doc, "LWPOLYLINE")) == [
+        "LINES_000000", "OUTLINE_0000FF", "OUTLINE_0000FF", "OUTLINE_FF0000"]
+    assert [e.dxf.layer for e in of_type(doc, "SPLINE")] == ["OUTLINE_FF0000"]  # the circle, one entity
+    assert meta["recognized"]["hatches"] == 3
 
 
 def test_hatch_fills_render(fills_pdf, tmp_path):
@@ -404,3 +408,84 @@ def test_service_flag_set_on_sample_plan(sample_plan_pdf, tmp_path):
     assert rec["circles"] >= 1 and rec["arcs"] >= 4 and rec["hatches"] >= 6 and rec["linetypes"] >= 1
     assert meta["entities"] == len(doc.modelspace())
     assert non_white_fraction(png) > 0.005
+
+
+# -- engine 1.7: «cad» fills = HATCH of the painted area + one outline per subpath ------------
+def _hatch_polygons(hatch):
+    from shapely.geometry import Polygon
+
+    rings = [[(v[0], v[1]) for v in path.vertices] for path in hatch.paths]
+    return Polygon(rings[0], rings[1:])
+
+
+def test_cad_overlapping_letters_without_gaps(logo_pdf, tmp_path):
+    """Spec «Літери, що торкаються, без щілин»: one nonzero path of overlapping letters → one
+    HATCH of polyline boundaries whose area covers the overlaps."""
+    from shapely.geometry import Point
+
+    import make_sample
+
+    meta, doc = convert_ok(logo_pdf, tmp_path, *ALL_RECOGNITION)
+    dark = of_type(doc, "HATCH", "FILL_0D338C")
+    assert len(dark) == 2  # the joined letters, the «O» with its hole
+    assert all(type(p).__name__ == "PolylinePath" for h in of_type(doc, "HATCH") for p in h.paths)
+    word, letter_o = sorted(dark, key=lambda h: len(h.paths))
+    assert len(word.paths) == 1 and len(letter_o.paths) == 2
+    x, y = make_sample.LETTERS[1]
+    assert _hatch_polygons(word).contains(Point((x + 4) * PT2MM, (y + 45) * PT2MM))
+    ox, oy, ow, oh = make_sample.O_BOX
+    assert not _hatch_polygons(letter_o).contains(Point((ox + ow / 2) * PT2MM, (oy + oh / 2) * PT2MM))
+    assert meta["recognized"]["hatches"] == 3
+
+
+def test_cad_even_odd_square_keeps_its_hole(fills_pdf, tmp_path):
+    from shapely.geometry import Point
+
+    _, doc = convert_ok(fills_pdf, tmp_path, *ALL_RECOGNITION)
+    (blue,) = of_type(doc, "HATCH", "FILL_0000FF")
+    assert len(blue.paths) == 2
+    assert not _hatch_polygons(blue).contains(Point(*to_mm(150, 300)))  # the inner square
+    assert _hatch_polygons(blue).contains(Point(*to_mm(75, 300)))
+
+
+def test_cad_outline_per_subpath(outline_pdf, tmp_path):
+    """Spec «Контур заливки — одна сутність»: 40 Béziers + 6 lines → one closed SPLINE; a
+    rectangle → one closed LWPOLYLINE; a circle of 4 Béziers → CIRCLE (--arcs)."""
+    _, doc = convert_ok(outline_pdf, tmp_path, *ALL_RECOGNITION)
+    (spline,) = [e for e in doc.modelspace() if e.dxf.layer == "OUTLINE_CC1A1A"]
+    assert spline.dxftype() == "SPLINE"
+    cps = spline.control_points
+    assert len(cps) == 3 * 46 + 1 and tuple(cps[0]) == tuple(cps[-1])  # 46 pieces, closed
+    (rect,) = [e for e in doc.modelspace() if e.dxf.layer == "OUTLINE_1A991A"]
+    assert rect.dxftype() == "LWPOLYLINE" and rect.closed and len(rect) == 4
+    (circle,) = [e for e in doc.modelspace() if e.dxf.layer == "OUTLINE_1A1ACC"]
+    assert circle.dxftype() == "CIRCLE"
+    assert circle.dxf.radius == pytest.approx(40 * PT2MM, rel=1e-3)
+    assert not of_type(doc, "ARC")  # fill outlines are not cut into arcs
+
+
+def test_cad_outlines_follow_the_pdf_layer(ocg_logo_pdf, tmp_path):
+    _, doc = convert_ok(ocg_logo_pdf, tmp_path, *ALL_RECOGNITION)
+    assert {e.dxf.layer for e in doc.modelspace()} == {"LOGO"}
+    for dxftype in ("HATCH", "CIRCLE", "LWPOLYLINE"):
+        assert of_type(doc, dxftype, "LOGO")
+
+
+def test_cad_hatch_layers_off_leave_every_outline(logo_pdf, tmp_path):
+    """Spec «Вимкнено шар штриховок»: the OUTLINE layers alone draw every figure."""
+    _, doc = convert_ok(logo_pdf, tmp_path, *ALL_RECOGNITION)
+    outlines = [e for e in doc.modelspace() if e.dxf.layer.startswith("OUTLINE_")]
+    assert len(outlines) == 6  # 3 letters, the «O» outside and inside, the swoosh
+    assert {e.dxftype() for e in outlines} == {"SPLINE"}
+
+
+def test_cad_preview_fills_the_overlap(logo_pdf, tmp_path):
+    import make_sample
+    from conftest import preview_pixel
+
+    png = tmp_path / "logo.png"
+    _, doc = convert_ok(logo_pdf, tmp_path, *ALL_RECOGNITION, "--preview", png)
+    lo, hi = doc.header["$EXTMIN"], doc.header["$EXTMAX"]
+    x, y = make_sample.LETTERS[1]
+    r, g, b = preview_pixel(png, (lo[0], lo[1], hi[0], hi[1]), (x + 4) * PT2MM, (y + 45) * PT2MM)
+    assert all(abs(v - ref) < 16 for v, ref in zip((r, g, b), (0x0D, 0x33, 0x8C), strict=True))  # no gap

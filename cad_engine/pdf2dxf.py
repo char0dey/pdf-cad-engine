@@ -7,7 +7,9 @@ What ends up in the DXF (AutoCAD 2010, Y up; millimetres at 1 pt = 25.4/72 mm by
 - consecutive line segments of one path -> one LWPOLYLINE;
 - rectangles and quads -> closed LWPOLYLINEs;
 - cubic Béziers -> degree-3 SPLINEs with the same control points (exact);
-- fill-only paths -> closed LWPOLYLINEs on ``FILL_RRGGBB`` layers;
+- fill-only paths -> closed LWPOLYLINEs on ``FILL_RRGGBB`` layers; with ``--hatch-fills`` (engine
+  1.7) a solid HATCH of the painted area (`cad_engine.fill_regions`: the PDF nonzero / even-odd
+  rule) plus one closed outline per subpath on ``OUTLINE_RRGGBB``;
 - real PDF text -> TEXT (string, height from the font size, rotation, baseline origin);
   text drawn as glyph outlines stays outlines; invisible text (OCR layers) is skipped;
 - layers: the PDF optional-content layer name when present, else
@@ -20,20 +22,29 @@ Optional recognition (all off by default, see `Options` and README):
 ``--arcs`` circles/arcs, ``--hatch-fills`` solid HATCH, ``--linetypes`` DASHED/DOT,
 ``--merge`` joined pieces and dropped duplicates, ``--scale``/``--units`` output units,
 ``--raster-fallback`` traced polylines for pages that are only images (OpenCV).
+
+``--cut`` (engine 1.7, overrides the four recognition flags) writes what cutting programs (CAM,
+laser, plasma, plotter) take as tool paths, as AutoCAD R2000: every painted fill area becomes
+closed LWPOLYLINEs (outline and holes) on ``CUT_RRGGBB`` with the nearest ACI colour — same
+colours merged, a later fill covering the earlier ones of other colours, white cutting out of
+colour (or standing alone where nothing is under it), the paper skipped; strokes become plain
+LWPOLYLINEs, curves flattened within 0.01 paper mm; real text stays TEXT. No HATCH, SPLINE,
+ARC, CIRCLE, ELLIPSE or linetypes.
 """
 
 from __future__ import annotations
 
 import math
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from cad_engine import outputs
 from cad_engine.budget import Budget
 from cad_engine.errors import InputError
-from cad_engine.preview import PreviewRecorder
+from cad_engine.fill_regions import fill_region, flatten_segments, polygon_rings, subpath_ring
+from cad_engine.preview import CUT_MIN_STROKE_PX, MIN_STROKE_PX, PreviewRecorder
 from cad_engine.recognize import (
     ArcRun,
     DashRun,
@@ -56,6 +67,10 @@ PAGE_GAP_MIN_MM = 20.0
 PAGE_GAP_RATIO = 0.10
 TEXT_HEIGHT_RATIO = 0.72  # font size (em) -> approximate cap height
 BACKGROUND_AREA_RATIO = 0.95  # a white fill covering this much of the page is the paper, not content
+WHITE_MIN = 250  # an RGB fill with every channel at least this is white (paper, cut-outs)
+FILL_MIN_AREA_PT2 = 1e-6  # fill rings / pieces smaller than this (pt²) are degenerate
+CUT_GRID = 32  # --cut: cells per page side of the index of painted pieces
+CUT_EXCLUDED_ACI = frozenset({0, 7, 255})  # BYBLOCK, the black/white swap colour, white
 CHECK_EVERY = 1000  # budget checkpoint every N entities
 
 # Tolerances in paper millimetres (multiplied by the output factor).
@@ -65,6 +80,8 @@ MERGE_LATERAL_TOL_MM = 0.01  # --merge: collinear vertices
 DASH_LATERAL_TOL_MM = 0.01  # --linetypes: dashes on one line
 DASH_MAX_MM = 25.0  # --linetypes: longest dash / gap of a dashed run
 DOT_MAX_MM = 0.6  # --linetypes: dashes up to this length (and not longer than the gap) are dots
+FLATTEN_TOL_MM = 0.01  # fill regions / --cut: chord error of flattened Béziers
+CUT_SIMPLIFY_MM = 1e-6  # --cut: drops the collinear vertices the region union leaves on edges
 
 SCALES = {"asis": 1.0, "1-50": 50.0, "1-100": 100.0, "1-200": 200.0}
 UNITS = ("mm", "inch")
@@ -73,7 +90,6 @@ UNITS = ("mm", "inch")
 LINETYPE_PERIOD = {"DASHED": 0.6, "DOT": 0.2}
 LINETYPE_DASH_RATIO = {"DASHED": 0.5 / 0.6, "DOT": 0.0}  # dash length / period (for the preview)
 TRACED_LAYER = "TRACED"
-_KNOTS4 = (0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0)
 
 VALID_LINEWEIGHTS = (0, 5, 9, 13, 15, 18, 20, 25, 30, 35, 40, 50, 53, 60, 70, 80, 90, 100, 106, 120, 140,
                      158, 200, 211)
@@ -92,6 +108,7 @@ class Options:
     raster_fallback: bool = False
     scale: str = "asis"
     units: str = "mm"
+    cut: bool = False  # engine 1.7: closed contours for cutting; overrides the four flags above
 
     def __post_init__(self) -> None:
         if self.scale not in SCALES:
@@ -108,6 +125,13 @@ class Options:
     @property
     def recognizes(self) -> bool:
         return self.arcs or self.hatch_fills or self.linetypes or self.merge
+
+    @property
+    def effective(self) -> Options:
+        """The options the writer applies: ``--cut`` switches the recognition flags off."""
+        if not self.cut:
+            return self
+        return replace(self, arcs=False, hatch_fills=False, linetypes=False, merge=False)
 
 
 def open_pdf(path: str) -> pymupdf.Document:
@@ -154,6 +178,27 @@ def rgb_of(color) -> tuple[int, int, int]:
         c, m, y, k = values
         values = [(1 - c) * (1 - k), (1 - m) * (1 - k), (1 - y) * (1 - k)]
     return tuple(int(round(v * 255)) for v in values[:3])  # type: ignore[return-value]
+
+
+@lru_cache(maxsize=4096)
+def nearest_aci(rgb: tuple[int, int, int]) -> int:
+    """The AutoCAD Color Index closest to `rgb` (Euclidean in RGB), without 0, 7 and 255 —
+    R2000 has no true colour for layers (--cut)."""
+    from ezdxf.colors import DXF_DEFAULT_COLORS
+
+    best, best_d = 1, math.inf
+    for index, packed in enumerate(DXF_DEFAULT_COLORS):
+        if index in CUT_EXCLUDED_ACI:
+            continue
+        r, g, b = (packed >> 16) & 255, (packed >> 8) & 255, packed & 255
+        d = (r - rgb[0]) ** 2 + (g - rgb[1]) ** 2 + (b - rgb[2]) ** 2
+        if d < best_d:
+            best, best_d = index, d
+    return best
+
+
+def is_white(rgb: tuple[int, int, int]) -> bool:
+    return min(rgb) >= WHITE_MIN
 
 
 def sanitize_layer_name(name: str) -> str:
@@ -251,6 +296,133 @@ class _Ctx:
         self.rec = rec
 
 
+class _CutCanvas:
+    """Painted areas of one page in draw order (``--cut``).
+
+    Pieces are (rgb, geometry). A new region of colour c cuts itself out of the pieces of other
+    colours under it and joins the pieces of c; a white region keeps only its part outside the
+    coloured pieces under it (white over colour = a cut-out, white on nothing = an outline). A
+    grid of cells per colour over the page finds the pieces of other colours a region may touch
+    (a page of one colour — text in curves — never looks at its neighbours).
+    """
+
+    MAX_CELLS = 4096  # a region spanning more cells is checked against every piece
+
+    def __init__(self, cell: float, min_area: float) -> None:
+        self.cell = cell if cell > 0 else 1.0
+        self.min_area = min_area
+        self.rgb: list[tuple[int, int, int]] = []
+        self.geom: list = []
+        self.cells: dict[tuple[int, int, int], dict[tuple[int, int], list[int]]] = {}
+        self.wide: dict[tuple[int, int, int], list[int]] = {}  # pieces registered without cells
+
+    def _cells(self, bounds) -> list[tuple[int, int]] | None:
+        c = self.cell
+        i0, j0 = math.floor(bounds[0] / c), math.floor(bounds[1] / c)
+        i1, j1 = math.floor(bounds[2] / c), math.floor(bounds[3] / c)
+        if (i1 - i0 + 1) * (j1 - j0 + 1) > self.MAX_CELLS:
+            return None
+        return [(i, j) for i in range(i0, i1 + 1) for j in range(j0, j1 + 1)]
+
+    def _candidates(self, rgb, bounds) -> list[int]:
+        """Alive pieces of colours other than `rgb` whose bounding box meets `bounds`."""
+        others = [c for c in self.cells if c != rgb]
+        if not others:
+            return []
+        keys = self._cells(bounds)
+        found: set[int] = set()
+        for colour in others:
+            found.update(self.wide.get(colour, ()))
+            if keys is None:
+                for ids in self.cells[colour].values():
+                    found.update(ids)
+            else:
+                cells = self.cells[colour]
+                for key in keys:
+                    found.update(cells.get(key, ()))
+        x0, y0, x1, y1 = bounds
+        out = []
+        for i in sorted(found):
+            g = self.geom[i]
+            if g is None:
+                continue
+            b = g.bounds
+            if b[0] <= x1 and x0 <= b[2] and b[1] <= y1 and y0 <= b[3]:
+                out.append(i)
+        return out
+
+    def add(self, rgb: tuple[int, int, int], polys: list) -> None:
+        import shapely
+
+        region = polys[0] if len(polys) == 1 else shapely.union_all(polys)
+        if region.is_empty:
+            return
+        under = self._candidates(rgb, region.bounds)
+        kept = region  # what this colour adds: white only where no colour lies under it
+        if is_white(rgb):
+            colour = [self.geom[i] for i in under if not is_white(self.rgb[i])]
+            if colour:
+                kept = region.difference(shapely.union_all(colour))
+        for i in under:  # the whole region covers what lies under it
+            g = self.geom[i]
+            if g.intersects(region):
+                g = g.difference(region)
+                self.geom[i] = None if g.is_empty or g.area < self.min_area else g
+        region = kept
+        if region.is_empty or region.area < self.min_area:
+            return
+        index = len(self.geom)
+        self.rgb.append(rgb)
+        self.geom.append(region)
+        keys = self._cells(region.bounds)
+        cells = self.cells.setdefault(rgb, {})
+        if keys is None:
+            self.wide.setdefault(rgb, []).append(index)
+        else:
+            for key in keys:
+                cells.setdefault(key, []).append(index)
+
+    def by_colour(self) -> list[tuple[tuple[int, int, int], list]]:
+        """Alive pieces grouped by colour, colours in the order they were first painted."""
+        groups: dict[tuple[int, int, int], list] = {}
+        for rgb, g in zip(self.rgb, self.geom, strict=True):
+            if g is not None:
+                groups.setdefault(rgb, []).append(g)
+        return list(groups.items())
+
+
+def _merge_touching(pieces: list) -> list:
+    """The union of `pieces`, done only where pieces touch: clusters of touching pieces (one bulk
+    STRtree query) are united, a piece touching nothing passes as it is — glyphs of text in
+    curves mostly do not touch, and one union of 100 000 of them took seconds."""
+    import numpy as np
+    import shapely
+
+    geoms = np.asarray(pieces, dtype=object)
+    if len(geoms) < 2:
+        return list(geoms)
+    left, right = shapely.STRtree(geoms).query(geoms, predicate="intersects")
+    pairs = left != right
+    if not pairs.any():
+        return list(geoms)
+    parent = list(range(len(geoms)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for a, b in zip(left[pairs].tolist(), right[pairs].tolist(), strict=True):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    clusters: dict[int, list[int]] = {}
+    for i in range(len(geoms)):
+        clusters.setdefault(find(i), []).append(i)
+    return [geoms[ids[0]] if len(ids) == 1 else shapely.union_all(geoms[ids]) for ids in clusters.values()]
+
+
 def _rounded(points) -> tuple:
     return tuple(round(v, 6) for p in points for v in p)
 
@@ -264,14 +436,19 @@ class DxfWriter:
         from ezdxf import units
 
         self._ezdxf = ezdxf
-        self.opts = options or Options()
+        self.opts = (options or Options()).effective
+        self.cut = self.opts.cut
         self.factor = self.opts.factor
-        self.doc = ezdxf.new("R2010", setup=True)
+        # --cut: AutoCAD R2000, read by every cutting program (no true colour: layers get ACI)
+        self.doc = ezdxf.new("R2000" if self.cut else "R2010", setup=True)
+        # $INSUNITS and $MEASUREMENT always agree: importers such as Inkscape ("Read from file")
+        # scale by $MEASUREMENT only (case 19.11: inches with $MEASUREMENT 1 came out 25.4 x small)
         if self.opts.units == "inch":
             self.doc.units = units.IN
             self.doc.header["$MEASUREMENT"] = 0  # imperial
         else:
             self.doc.units = units.MM
+            self.doc.header["$MEASUREMENT"] = 1  # metric
         self.msp = self.doc.modelspace()
         self.budget = budget
         self.max_entities = max_entities
@@ -279,6 +456,9 @@ class DxfWriter:
         self.text_entities = 0
         self.vector_entities = 0
         self.traced_entities = 0
+        self.visible_paths = 0  # paths with a visible stroke or fill, the paper included
+        self.contours = 0  # --cut: closed LWPOLYLINEs of fill areas
+        self._canvas: _CutCanvas | None = None  # --cut: the fills of the current page
         self.recognized = {"circles": 0, "arcs": 0, "hatches": 0, "linetypes": 0, "merged": 0}
         self._seen: set | None = set() if self.opts.merge else None
         self._layers: dict[str, tuple[str, tuple[int, int, int] | None]] = {}  # lower name -> (name, rgb)
@@ -286,10 +466,14 @@ class DxfWriter:
         self._hidden: set[str] = set()  # lower-case DXF layer names created off
         self.min_x = self.min_y = math.inf
         self.max_x = self.max_y = -math.inf
-        self.preview = PreviewRecorder(unit_scale=self.factor) if record_preview else None
+        self.preview = None
+        if record_preview:
+            self.preview = PreviewRecorder(unit_scale=self.factor,
+                                           min_stroke_px=CUT_MIN_STROKE_PX if self.cut else MIN_STROKE_PX)
         k = self.factor
         self._join_tol = JOIN_TOL_MM * k
         self._eps = EPS_MM * k
+        self._flat_tol = FLATTEN_TOL_MM * k
 
     # -- bookkeeping -------------------------------------------------------------------
     def _tick(self) -> None:
@@ -350,7 +534,10 @@ class DxfWriter:
             # keep its definition, entities carry their own colour
             entry = (layers.get(name).dxf.name, None)
         else:
-            layer = layers.add(name, true_color=self._ezdxf.rgb2int(rgb))
+            if self.cut:
+                layer = layers.add(name, color=nearest_aci(rgb))
+            else:
+                layer = layers.add(name, true_color=self._ezdxf.rgb2int(rgb))
             if off:
                 layer.off()
                 self._hidden.add(name.lower())
@@ -364,7 +551,10 @@ class DxfWriter:
         if lineweight_value is not None:
             attribs["lineweight"] = lineweight_value
         if own_color:
-            attribs["true_color"] = self._ezdxf.rgb2int(rgb)
+            if self.cut:
+                attribs["color"] = nearest_aci(rgb)
+            else:
+                attribs["true_color"] = self._ezdxf.rgb2int(rgb)
         return attribs
 
     # -- entity primitives -------------------------------------------------------------
@@ -457,48 +647,146 @@ class DxfWriter:
             on = period * LINETYPE_DASH_RATIO[ltype]
             ctx.rec.polyline((rgb, width_pt, (on, period - on)), pts, False)
 
-    def _hatch(self, subpaths: list, ctx: _Ctx, rgb) -> None:
-        loops: list[list[tuple]] = []
-        for kind, data in subpaths:
-            if kind == "p":
-                loops.append([("l", data[i], data[(i + 1) % 4]) for i in range(4)])
-                continue
-            # edges joined exactly (the PDF may leave gaps up to the join tolerance), loop closed
-            segs = [data[0]]
-            for seg in data[1:]:
-                segs.append((seg[0], segs[-1][-1], *seg[2:]))
-            if _dist(segs[-1][-1], segs[0][1]) > self._join_tol:
-                segs.append(("l", segs[-1][-1], segs[0][1]))
-            else:
-                last = segs[-1]
-                segs[-1] = (*last[:-1], segs[0][1])
-            if all(s[0] == "l" for s in segs) and len(segs) < 3:
-                continue  # zero-area loop
-            loops.append(segs)
-        if not loops:
-            return
-        points = [p for loop in loops for seg in loop for p in seg[1:]]
+    def _min_area(self, pm: PageMap) -> float:
+        return FILL_MIN_AREA_PT2 * pm.k * pm.k
+
+    def _region(self, subpaths: list, even_odd: bool, pm: PageMap) -> list:
+        """The painted area of one path (`cad_engine.fill_regions`), in drawing units."""
+        rings = [subpath_ring(kind, data, self._flat_tol) for kind, data in subpaths]
+        return fill_region(rings, even_odd=even_odd, min_area=self._min_area(pm))
+
+    def _fill_cad(self, subpaths: list, ctx: _Ctx, outline: _Ctx, rgb, even_odd: bool, pm: PageMap) -> None:
+        """--hatch-fills: a solid HATCH per polygon of the painted area (polyline boundaries, so
+        overlapping subpaths stay filled under nonzero) and one closed outline per subpath. The
+        preview paints the subpaths themselves by the path's rule: the same area, a fraction of
+        the vertices."""
+        hatches = 0
+        for poly in self._region(subpaths, even_odd, pm):
+            hatches += self._hatch_polygon(poly, ctx)
+        loops = [self._closed_loop(kind, data) for kind, data in subpaths]
+        for loop in loops:
+            self._outline(loop, outline)
+        if hatches and ctx.rec is not None:
+            ctx.rec.fill(rgb, [loop for loop in loops if len(loop) >= 2], even_odd)
+
+    def _hatch_polygon(self, poly, ctx: _Ctx) -> int:
+        """One solid HATCH of a polygon (outline + holes as polyline boundaries); 1 if written."""
+        rings = [r for r in polygon_rings(poly) if len(r) >= 3]
+        if not rings:
+            return 0
+        points = [p for ring in rings for p in ring]
         if self._seen is not None:
             if not self._admit(("H", ctx.akey, _rounded(points))):
-                return
+                return 0
         else:
             self._tick()
         self.vector_entities += 1
         self.recognized["hatches"] += 1
         hatch = self.msp.add_hatch(color=256, dxfattribs=ctx.attribs)  # solid fill, BYLAYER colour
-        for loop in loops:
-            if all(s[0] == "l" for s in loop):
-                hatch.paths.add_polyline_path([s[1] for s in loop], is_closed=True)
-            else:
-                edges = hatch.paths.add_edge_path()
-                for seg in loop:
-                    if seg[0] == "l":
-                        edges.add_line(seg[1], seg[2])
-                    else:
-                        edges.add_spline(control_points=seg[1:], knot_values=_KNOTS4, degree=3)
+        for index, ring in enumerate(rings):
+            hatch.paths.add_polyline_path(ring, is_closed=True, flags=1 if index == 0 else 0)
         self._extend(points)
-        if ctx.rec is not None:
-            ctx.rec.fill(rgb, loops)
+        return 1
+
+    def _closed_loop(self, kind: str, data: list) -> list:
+        """A fill subpath as a closed loop of ('l', a, b) / ('c', p0, p1, p2, p3) segments: pieces
+        joined exactly (the PDF may leave gaps up to the join tolerance), the end on the start."""
+        if kind == "p":
+            return [("l", data[i], data[(i + 1) % 4]) for i in range(4)]
+        segs = [data[0]]
+        for seg in data[1:]:
+            segs.append((seg[0], segs[-1][-1], *seg[2:]))
+        if _dist(segs[-1][-1], segs[0][1]) > self._join_tol:
+            segs.append(("l", segs[-1][-1], segs[0][1]))
+        else:
+            last = segs[-1]
+            segs[-1] = (*last[:-1], segs[0][1])
+        return segs
+
+    def _outline(self, segs: list, ctx: _Ctx) -> None:
+        """One closed entity for one fill subpath (`_closed_loop`): CIRCLE (--arcs, a whole
+        circle), a closed LWPOLYLINE (only lines) or one closed SPLINE (the Béziers, lines as
+        straight Béziers)."""
+        if all(s[0] == "l" for s in segs):
+            if len(segs) >= 3:  # fewer is a zero-area loop
+                self._polyline([s[1] for s in segs], True, ctx)
+            return
+        if self.opts.arcs:
+            runs = find_arc_runs(segs)
+            if len(runs) == 1 and runs[0].circle and runs[0].first == 0 and runs[0].end == len(segs):
+                self._arc(runs[0], segs, ctx)
+                return
+        self._spline([s[1:] if s[0] == "c" else line_as_bezier(s[1], s[2]) for s in segs], ctx)
+
+    # -- --cut -------------------------------------------------------------------------
+    def _cut_path(self, drawing: dict, pm: PageMap, stroke, fill) -> None:
+        """--cut: a fill joins the page canvas (contours written by `finish_page`); a stroke
+        without fill becomes plain LWPOLYLINEs; the outline of a filled path is its fill."""
+        ocg = drawing.get("layer")
+        if fill is not None:
+            if (is_white(rgb_of(fill)) and pm.is_background(drawing.get("rect"))) or ocg in self.layers_off:
+                fill = None  # the paper / content of a PDF layer that is off
+        if fill is None and stroke is None:
+            return
+        subpaths = self._subpaths(drawing["items"], pm)
+        if not subpaths:
+            return
+        if fill is not None:
+            polys = self._region(subpaths, bool(drawing.get("even_odd")), pm)
+            if polys:
+                if self._canvas is None:
+                    self._canvas = _CutCanvas(pm.width * pm.k / CUT_GRID, self._min_area(pm))
+                self._canvas.add(rgb_of(fill), polys)
+            return
+        rgb = rgb_of(stroke)
+        width_pt = float(drawing.get("width") or 0.0)
+        attribs = self._attribs("LINES", rgb, ocg, lineweight(width_pt))
+        rec = self.preview if attribs["layer"].lower() not in self._hidden else None
+        ctx = _Ctx(attribs, (rgb, width_pt, None), rec)
+        close = bool(drawing.get("closePath"))
+        last = len(subpaths) - 1
+        for i, (kind, data) in enumerate(subpaths):
+            if kind == "p":
+                self._polyline(list(data), True, ctx)
+                continue
+            pts = flatten_segments(data, self._flat_tol)
+            closed = close and i == last
+            if len(pts) > 2 and _dist(pts[-1], pts[0]) <= self._join_tol:
+                pts.pop()
+                closed = True
+            if len(pts) >= 2:
+                self._polyline(pts, closed, ctx)
+
+    def finish_page(self) -> None:
+        """--cut: write the page canvas — per colour the union of its pieces as closed LWPOLYLINEs
+        (outline and holes) on ``CUT_RRGGBB``."""
+        canvas, self._canvas = self._canvas, None
+        if canvas is None:
+            return
+        import shapely
+
+        simplify = CUT_SIMPLIFY_MM * self.factor
+        for rgb, pieces in canvas.by_colour():
+            self.budget.check()
+            merged = shapely.get_parts(_merge_touching(pieces))
+            if simplify > 0:
+                merged = shapely.simplify(merged, simplify)
+            polys = [g for g in merged if g.geom_type == "Polygon" and g.area >= canvas.min_area]
+            if not polys:
+                continue
+            attribs = self._attribs("CUT", rgb, None, 0)
+            style = (rgb, 0.0, None)
+            for poly in polys:
+                for ring in polygon_rings(poly):
+                    if len(ring) < 3:
+                        continue
+                    self._tick()
+                    self.vector_entities += 1
+                    self.contours += 1
+                    self.msp.add_lwpolyline(ring, close=True, dxfattribs=attribs)
+                    self._extend(ring)
+                    if self.preview is not None:
+                        self.preview.polyline(style, ring, True)
 
     # -- paths -------------------------------------------------------------------------
     def _subpaths(self, items, pm: PageMap) -> list[tuple[str, list]]:
@@ -537,6 +825,10 @@ class DxfWriter:
             fill = None
         if stroke is None and fill is None:
             return
+        self.visible_paths += 1
+        if self.cut:
+            self._cut_path(drawing, pm, stroke, fill)
+            return
         fill_only = stroke is None
         rgb = rgb_of(fill if fill_only else stroke)
         if fill_only and min(rgb) >= 250 and pm.is_background(drawing.get("rect")):
@@ -551,7 +843,11 @@ class DxfWriter:
             return
 
         if fill_only and opts.hatch_fills:
-            self._hatch(subpaths, _Ctx(attribs, (rgb, width_pt, None), rec), rgb)
+            outline = self._attribs("OUTLINE", rgb, drawing.get("layer"), 0)
+            outline_rec = self.preview if outline["layer"].lower() not in self._hidden else None
+            self._fill_cad(subpaths, _Ctx(attribs, (rgb, width_pt, None), rec),
+                           _Ctx(outline, (rgb, 0.0, None), outline_rec), rgb,
+                           bool(drawing.get("even_odd")), pm)
             return
 
         dash_style = None
@@ -772,6 +1068,7 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, preview_path: str
     opts = options or Options()
     meta["scale"] = opts.scale
     meta["units"] = opts.units
+    meta["purpose"] = "cut" if opts.cut else "cad"
     warnings = meta.setdefault("warnings", [])
     if warnings is None:
         warnings = meta["warnings"] = []
@@ -802,6 +1099,7 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, preview_path: str
             before = writer.entities
             for drawing in page.get_drawings():
                 writer.add_path(drawing, pm)
+            writer.finish_page()
             budget.check()
             _add_page_text(writer, page, pm, flags, has_ocg)
             page_images = len(page.get_images())
@@ -830,10 +1128,16 @@ def convert(src: str, dst: str, *, budget: Budget, meta: dict, preview_path: str
         meta["images"] = images
         meta["recognized"] = dict(writer.recognized)
         meta["traced_pages"] = traced_pages
+        if opts.cut:
+            meta["contours"] = writer.contours
+            meta["cut_text_kept"] = writer.text_entities
 
     meta["has_vectors"] = writer.entities - writer.traced_entities > 0
     meta["text_as_outlines"] = writer.text_entities == 0 and writer.vector_entities > 0
     if writer.entities == 0:
+        if opts.cut and writer.visible_paths:
+            # only the paper (or areas covered away): nothing to cut, not a scan
+            raise InputError("empty_drawing", "nothing to cut: the PDF draws only the paper")
         raise InputError("no_vectors", "the PDF has no vector drawings or text (scanned image?)")
 
     budget.check()

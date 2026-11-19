@@ -14,7 +14,7 @@ It runs as a separate process with a small, stable command-line contract.
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt   # exact pins (server installs), OpenCV included
 .venv/bin/pip install -e .                  # or: pip install .
-.venv/bin/python -I -m cad_engine --version # -> 1.4.0
+.venv/bin/python -I -m cad_engine --version # -> 1.7.0
 ```
 
 Development: `.venv/bin/pip install -e '.[dev,raster]'` (pytest, ruff, OpenCV).
@@ -30,15 +30,15 @@ warning `raster_fallback_unavailable` in the meta instead of tracing (see below)
 python -I -m cad_engine <command> --in <file> [--out <file>] [--preview <png>]
                         [--meta <path>] [--budget-ms N] [--tmp <dir>]
                         [pdf2dxf options] [dxf2pdf options] [--light]
-python -I -m cad_engine --version          # prints "1.4.0"
+python -I -m cad_engine --version          # prints "1.7.0"
 cad-engine ...                             # console script, same arguments
 ```
 
 | Command       | Input | Output (`--out`)  | Notes |
 |---------------|-------|-------------------|-------|
-| `pdf2dxf`     | PDF   | DXF (R2010, mm)   | `--preview out.png`: PNG of the extracted geometry |
+| `pdf2dxf`     | PDF   | DXF (R2010, mm; `--cut`: R2000) | `--preview out.png`: PNG of the extracted geometry |
 | `dxf2pdf`     | DXF   | PDF (1 page; + layouts) | ASCII or binary DXF; damaged files are recovered |
-| `probe-pdf`   | PDF   | —                 | pages, `vector_paths` / `vector_segments` of all pages (1.6), `has_vectors` / `text_entities` on the first 5 pages |
+| `probe-pdf`   | PDF   | —                 | pages, `vector_paths` / `vector_segments` of all pages (1.6), `has_vectors` / `text_entities` on the first 5 pages, `suggested_purpose` (1.7) |
 | `probe-dxf`   | DXF   | —                 | `entities`, `empty` / `empty_reason`, `dxf_version`, `layers`, `layouts`, the content scan; `--light`: the scan only |
 | `preview-dxf` | DXF   | PNG               | model space, longest side 1400 px, white background |
 
@@ -61,11 +61,12 @@ the ones it wants explicitly. Using a pdf2dxf option with another command is a u
 | Flag | Effect |
 |------|--------|
 | `--arcs` | A run of consecutive cubic Béziers of one contiguous subpath that lies on one circle (every sample point within 0.5 % of the radius, and of the chord for short curves) becomes one entity: a closed run with a full 360° turn → `CIRCLE` (e.g. the 4 Béziers of a PDF circle); otherwise → `ARC`, counter-clockwise from `start_angle` to `end_angle` as DXF requires (1 Bézier of 90° → ARC 0°–90°, 2 Béziers of 180° → one ARC). Ellipses (axis ratio ≠ 1), S-curves and other curves stay `SPLINE`. |
-| `--hatch-fills` | A fill-only path becomes one solid `HATCH` (pattern `SOLID`, colour BYLAYER on its `FILL_RRGGBB` / PDF layer, which keeps the fill colour) with one boundary loop per subpath: polyline loops for straight subpaths and rectangles, edge loops (line + spline edges) for curved ones; open loops are closed. Text drawn as glyph outlines thus comes out filled. Paths with both fill and stroke stay outlines. |
+| `--hatch-fills` | (1.7) A fill-only path becomes the area the PDF paints — its fill rule applied (`cad_engine/fill_regions.py`: nonzero or even-odd, so overlapping letters of one path stay filled and holes stay holes) — as one solid `HATCH` per polygon of that area (pattern `SOLID`, colour BYLAYER on its `FILL_RRGGBB` / PDF layer, which keeps the fill colour), with polyline boundaries (outline + holes; curves flattened within 0.01 paper mm), **plus** one closed outline per subpath on `OUTLINE_RRGGBB` (or the PDF layer): a closed `LWPOLYLINE` for a subpath of lines, a `CIRCLE` for a whole circle with `--arcs`, otherwise one closed `SPLINE` through the same control points (lines as straight Béziers); fill outlines are not cut into arcs. Text drawn as glyph outlines thus comes out filled and outlined. Paths with both fill and stroke stay outlines. Up to 1.6 a HATCH had one loop per subpath with spline edges and odd parity: overlaps became holes, and cutting programs (LightBurn, Fusion, Inkscape, LibreCAD) read no outline. |
 | `--linetypes` | (1) Runs of ≥ 4 consecutive single-segment subpaths of one path that are collinear (within 0.01 mm), advance in one direction, have near-equal dashes and gaps (±20 %; the first and the last dash may be shorter) and dashes/gaps ≤ 25 mm → one `LINE` from the start of the first dash to the end of the last, linetype `DOT` when the dash is ≤ 0.6 mm and not longer than the gap, else `DASHED`. A dashed curve is split into straight runs that stay within 0.01 mm. (2) A path stroked with a PDF dash array (`[6 3] 0`) keeps its geometry with linetype `DASHED`/`DOT` (polylines get the PLINEGEN flag). In both cases the entity linetype scale (`ltscale`) makes one pattern repeat equal to the PDF period (dash + gap). Segments that do not form such a run stay as they are. `DASHED`/`DOT` are the ezdxf standard linetypes in the document. |
 | `--merge` | Drops polyline vertices that lie within 0.01 mm on the line between their neighbours (and zero-length steps); joins consecutive Béziers of one subpath into one exact `SPLINE` (triple interior knots); turns a filled contour (fill-only subpath with curves, e.g. a glyph) into one `SPLINE` (straight edges as degree-elevated segments) instead of alternating polylines and splines; drops exact duplicates (same type, geometry, layer, colour, lineweight, linetype). The picture does not change (preview pixel difference < 1 % in the tests); entity counts drop ≥ 10 % on the sample plan and ≥ 30 % on the floorplan PDF. |
 | `--scale asis\|1-50\|1-100\|1-200` | Drawing scale (default `asis`: 1 pt = 25.4/72 mm). Coordinates, text heights, page gaps and linetype scales are multiplied by 1, 50, 100 or 200; lineweights are not scaled. A 100 mm line on paper at `1-100` → 10 000 mm. |
-| `--units mm\|inch` | DXF units (default `mm`). `inch` divides the millimetre values by 25.4 and sets `$INSUNITS = 1` (inches) and `$MEASUREMENT = 0`; `mm` sets `$INSUNITS = 4`. 72 pt at `asis` + `inch` → 1.0. |
+| `--units mm\|inch` | DXF units (default `mm`). `inch` divides the millimetre values by 25.4 and sets `$INSUNITS = 1` (inches) and `$MEASUREMENT = 0`; `mm` sets `$INSUNITS = 4` and `$MEASUREMENT = 1` (1.7: always both — Inkscape's "Read from file" scales by `$MEASUREMENT` alone). 72 pt at `asis` + `inch` → 1.0. |
+| `--cut` | (1.7) Closed contours for cutting programs (CNC, laser, plasma, plotter), AutoCAD R2000 (`AC1015`); `--arcs`, `--hatch-fills`, `--linetypes` and `--merge` are ignored. Fills (with or without stroke; the paper — a white fill over ≥ 95 % of the page — skipped): the painted area of each path (fill rule applied, as `--hatch-fills`) in drawing order — a later fill covers the part of earlier fills of other colours under it, a white fill (every channel ≥ 250) over colour cuts out of it and stays a contour only where nothing coloured is under it; per colour the union is written as closed `LWPOLYLINE`s (each outline and each hole) on `CUT_RRGGBB` with the nearest ACI colour (R2000 has no true colour; 0, 7 and 255 excluded; the exact RGB is in the name). Strokes without fill: every subpath one `LWPOLYLINE` (open or closed as in the PDF), dashes stay separate solid segments. Curves are flattened with a chord error ≤ 0.01 paper mm (`FLATTEN_TOL_MM`, scaled by `--scale`). No `HATCH`, `SPLINE`, `ARC`, `CIRCLE`, `ELLIPSE` or linetypes. Real text stays `TEXT` (counted in `cut_text_kept`: it will not be cut). Traced pages as without `--cut`. Nothing to cut (only the paper) → exit 2 `empty_drawing`. The preview shows the contours as lines (≥ 1.5 px), no fills. |
 | `--raster-fallback` | Pages without vectors (nothing extracted: no visible paths, no visible text) that contain images are rendered at 150 dpi in grey (lower for pages over 40 Mpx), binarised (halfway between Otsu's threshold and the paper grey), and the outlines of the dark areas are traced with OpenCV (`findContours` → `approxPolyDP`, 1 px; specks under 8 px dropped) → closed `LWPOLYLINE`s on layer `TRACED` (colour 7) in that page's slot. Their indices (0-based) go to `traced_pages`. Strokes come out as thin closed outlines, not centre lines; no TEXT. A scan-only PDF then converts (exit 0, `has_vectors: false`); a mixed PDF gets vectors on its vector pages and tracing on its scanned pages. The 500 000 entity limit applies. Without OpenCV: one line on stderr, `"raster_fallback_unavailable"` in `warnings`, the page stays empty (a scan-only PDF still exits 2 `no_vectors`). |
 
 The PNG preview (`--preview`) is drawn from the written entities: arcs and circles, solid
@@ -149,7 +150,7 @@ All keys are always present; `null` when not applicable to the command.
 
 | Key | Type | Set by |
 |-----|------|--------|
-| `version` | string | all (`"1.4.0"`) |
+| `version` | string | all (`"1.7.0"`) |
 | `command` | string | all |
 | `pages` | int | `pdf2dxf`, `probe-pdf`, `dxf2pdf` (PDF pages written: 1 + layouts; the layouts alone with `model_blank`) |
 | `entities` | int | `pdf2dxf` (DXF entities written), `dxf2pdf` / `probe-dxf` / `preview-dxf` (model space) |
@@ -163,6 +164,11 @@ All keys are always present; `null` when not applicable to the command.
 | `recognized` | object | `pdf2dxf` — `{"circles", "arcs", "hatches", "linetypes", "merged"}` counts (all 0 with the flags off): CIRCLE / ARC / HATCH entities written, entities given a DASHED/DOT linetype, entities saved by `--merge` (joined pieces + dropped duplicates) |
 | `scale` | string | `pdf2dxf` — `asis`, `1-50`, `1-100`, `1-200` |
 | `units` | string | `pdf2dxf` — `mm`, `inch` |
+| `purpose` | string | `pdf2dxf` (1.7) — `cut` with `--cut`, otherwise `cad` |
+| `contours` | int | `pdf2dxf --cut` (1.7) — closed `LWPOLYLINE`s written for fill areas (outlines + holes) |
+| `cut_text_kept` | int | `pdf2dxf --cut` (1.7) — real text spans written as `TEXT` (a cutting program will not cut them) |
+| `fill_paths` / `stroke_paths` | int | `probe-pdf` (1.7) — visible fills without stroke (the paper not counted) / stroked paths, counted on the pages read while the suggestion is open: the first stroke, real text or image settles it and the rest is not read |
+| `suggested_purpose` | string | `probe-pdf` (1.7) — `cut` for a PDF of fills only (≤ 5 pages, none too heavy to read, ≥ 1 fill, no stroke, no real text, no image), otherwise `cad`; null when the budget ran out first |
 | `empty` | bool | `probe-dxf` — nothing to draw: the answer for `dxf2pdf --layouts` (1.4: an empty model space with sheets that draw something is not empty) |
 | `empty_reason` | string | `probe-dxf` with `empty: true` — `aec_objects`, `external_refs_only` or `empty_drawing` |
 | `scanned` | bool | `probe-dxf`, `dxf2pdf` — the content scan finished (`false`: it failed, no findings) |
@@ -208,6 +214,15 @@ PDFs: all pages side by side along +X, gap max(20 mm, 10 % of the page width).
 of circles/arcs, hatches, linetypes, merging, scale/units and tracing.
 The preview is drawn from the extracted primitives with PyMuPDF (sub-second for ~40 000
 entities), not by re-rendering the DXF.
+
+Fill areas (1.7, `cad_engine/fill_regions.py`, used by `--hatch-fills` and `--cut`): every subpath
+of a path is flattened into a closed ring (cubic Béziers in n = ceil(sqrt(6·D / (8·tol))) equal
+parameter steps, D the larger second difference of the control points, tol 0.01 paper mm); rings
+whose bounding boxes do not touch are independent, and one simple ring is its own polygon (fast
+path: 20 000 paths of one 4-Bézier ring in 0.7 s on an Apple M-series laptop,
+`tests/test_fill_regions.py`); overlapping rings are noded and split into faces with shapely, and
+a face is painted when the winding number of a point inside it is non-zero (nonzero) or odd
+(even-odd). Rings under 1e-6 pt² are dropped.
 
 **DXF → PDF** (`dxf2pdf`, ezdxf drawing add-on + PyMuPDF backend): model space on one page,
 A4 or A3 (drawing larger than 20 m in `$INSUNITS`, or more than 5 000 entities) unless
@@ -272,7 +287,7 @@ paths or millions of hatch segments render 4–7 times faster.
 ```
 
 Inputs are generated at session start (`tests/make_sample.py`) into pytest's temp dir.
-`scripts/make_heavy_pdf.py OUT.pdf UNITS [--kind outlines|lines] [--pages N]` (1.6) writes a synthetic
+`scripts/make_heavy_pdf.py OUT.pdf UNITS [--kind outlines|fills|lines] [--pages N]` (1.6; `fills` 1.7) writes a synthetic
 heavy PDF of about `UNITS` paths + segments — text as glyph outlines or one-line-per-path linework —
 for calibrating the service's background threshold and the memory limit on a server. `tests/test_pdf_backend.py` renders the same drawings with
 ezdxf's stock PyMuPDF backend and compares pages pixel by pixel, the PDF layers and the timing.
@@ -300,7 +315,8 @@ generated at test time with PyMuPDF / ezdxf.
 | [PyMuPDF](https://github.com/pymupdf/PyMuPDF) 1.26.7 (MuPDF) | AGPL-3.0 (or Artifex commercial) | PDF reading, PDF/PNG output |
 | [ezdxf](https://github.com/mozman/ezdxf) 1.4.5 | MIT | DXF reading/writing, DXF rendering |
 | [Pillow](https://github.com/python-pillow/Pillow) 12.3.0 | HPND (MIT-CMU) | images in the ezdxf drawing add-on |
-| [numpy](https://numpy.org) 2.5.4 | BSD-3-Clause | ezdxf geometry |
+| [numpy](https://numpy.org) 2.5.4 | BSD-3-Clause | ezdxf geometry, winding numbers of fill areas |
+| [shapely](https://github.com/shapely/shapely) 2.2.0 (GEOS) | BSD-3-Clause (GEOS: LGPL-2.1) | fill areas and `--cut` contours (1.7) |
 | [OpenCV](https://opencv.org) (`opencv-python-headless` 4.14.0.94), optional extra `[raster]` | Apache-2.0 | `--raster-fallback` tracing |
 | fontTools 4.68.0, pyparsing 3.3.3, typing_extensions 4.16.0 | MIT, MIT, PSF-2.0 | ezdxf dependencies |
 

@@ -814,7 +814,7 @@ def build_dense_lines_pdf(out: Path, lines: int, *, form_calls: int = 0, noise: 
 
 #: Paths (``get_drawings()`` entries) + segments of one generated path, per kind (engine 1.6):
 #: a glyph outline is 5 segments (curves and lines), a line is one segment.
-HEAVY_UNITS_PER_PATH = {"outlines": 1 + 5, "lines": 1 + 1}
+HEAVY_UNITS_PER_PATH = {"outlines": 1 + 5, "fills": 1 + 5, "lines": 1 + 1}
 
 
 def _heavy_page(n: int, kind: str, rnd) -> bytes:
@@ -833,7 +833,7 @@ def _heavy_page(n: int, kind: str, rnd) -> bytes:
 
     for i in range(n):
         x0, y0 = (i % cols) * cw, (i // cols) * ch
-        if kind == "outlines":
+        if kind in ("outlines", "fills"):
             # a glyph filled and stroked (B), irregular curves (no arcs to recognise); two shapes in
             # turn: curve runs broken by lines (4 entities) and one curve run (2 entities), ~3 per
             # path as on the PROD 2026-11-16 page (406 629 entities from 147 895 paths)
@@ -847,7 +847,9 @@ def _heavy_page(n: int, kind: str, rnd) -> bytes:
                 c4 = (pt(x0, y0, 0.05, 0.45) + b" " + pt(x0, y0, 0.25, 0.3) + b" "
                       + pt(x0, y0, 0.3, 0.25) + b" c ")
                 body = c1 + c2 + c3 + c4 + start + b" l "
-            parts.append(start + b" m " + body + b"h B\n")
+            # "fills" (engine 1.7 calibration): the same glyphs filled only, as text converted to
+            # curves usually is — the paths --hatch-fills / --cut turn into fill areas
+            parts.append(start + b" m " + body + (b"h f\n" if kind == "fills" else b"h B\n"))
         else:
             # one line per path, as CAD exporters write linework (the PROD 2026-11-10 pattern)
             parts.append(pt(x0, y0, 0.1, 0.1, 0.1) + b" m " + pt(x0, y0, 0.9, 0.9, 0.1) + b" l S\n")
@@ -983,4 +985,225 @@ def build_sheets_only_dxf(out: Path, *, sheets=("A1", "A2"), content: str = "dra
     if sheets:
         doc.layouts.set_active_layout(sheets[0])
     doc.saveas(out, fmt=fmt)
+    return out
+
+
+# -- engine 1.7: fill regions and --cut (synthetic logos; no customer files) --------------------
+LOGO_W, LOGO_H = 612.0, 396.0  # pt, 8.5 x 5.5 in
+_KAPPA = 0.5522847498
+DARK_BLUE = (0.05, 0.2, 0.55)  # -> 0D338C
+LIGHT_BLUE = (0.3, 0.6, 0.9)  # -> 4D99E6
+
+
+def _rounded_rect(x: float, y: float, w: float, h: float, r: float) -> list[tuple]:
+    """Counter-clockwise (PDF y up) rounded rectangle: segments (a, b) and (a, c1, c2, b)."""
+    k = _KAPPA * r
+    return [
+        ((x + r, y), (x + w - r, y)),
+        ((x + w - r, y), (x + w - r + k, y), (x + w, y + r - k), (x + w, y + r)),
+        ((x + w, y + r), (x + w, y + h - r)),
+        ((x + w, y + h - r), (x + w, y + h - r + k), (x + w - r + k, y + h), (x + w - r, y + h)),
+        ((x + w - r, y + h), (x + r, y + h)),
+        ((x + r, y + h), (x + r - k, y + h), (x, y + h - r + k), (x, y + h - r)),
+        ((x, y + h - r), (x, y + r)),
+        ((x, y + r), (x, y + r - k), (x + r - k, y), (x + r, y)),
+    ]
+
+
+def _circle(cx: float, cy: float, r: float) -> list[tuple]:
+    """Counter-clockwise circle of 4 Béziers (as PDF writers draw it)."""
+    k = _KAPPA * r
+    return [
+        ((cx + r, cy), (cx + r, cy + k), (cx + k, cy + r), (cx, cy + r)),
+        ((cx, cy + r), (cx - k, cy + r), (cx - r, cy + k), (cx - r, cy)),
+        ((cx - r, cy), (cx - r, cy - k), (cx - k, cy - r), (cx, cy - r)),
+        ((cx, cy - r), (cx + k, cy - r), (cx + r, cy - k), (cx + r, cy)),
+    ]
+
+
+def _reverse(segs: list[tuple]) -> list[tuple]:
+    return [tuple(reversed(s)) for s in reversed(segs)]
+
+
+def _ops(segs: list[tuple]) -> bytes:
+    """One closed subpath as PDF operators."""
+    out = [b"%.3f %.3f m" % segs[0][0]]
+    for s in segs:
+        if len(s) == 2:
+            out.append(b"%.3f %.3f l" % s[1])
+        else:
+            out.append(b"%.3f %.3f %.3f %.3f %.3f %.3f c" % (*s[1], *s[2], *s[3]))
+    out.append(b"h\n")
+    return b" ".join(out)
+
+
+def _rg(rgb) -> bytes:
+    return b"%.3f %.3f %.3f rg\n" % tuple(rgb)
+
+
+def _content_pdf(out: Path, pages: list[bytes], *, width: float = LOGO_W, height: float = LOGO_H,
+                 fonts: bool = False, image: bool = False) -> Path:
+    """Pages from raw content streams (one object per page and stream)."""
+    resources = []
+    if fonts:
+        resources.append(b"/Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >>")
+    n = len(pages)
+    image_obj = 3 + 2 * n
+    if image:
+        resources.append(b"/XObject << /Im1 %d 0 R >>" % image_obj)
+    res = b"<< " + b" ".join(resources) + b" >>"
+    kids = b" ".join(b"%d 0 R" % (3 + 2 * i) for i in range(n))
+    objects = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [%s] /Count %d >>" % (kids, n)]
+    for i, content in enumerate(pages):
+        objects.append(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %.2f %.2f] /Resources %s "
+                       b"/Contents %d 0 R >>" % (width, height, res, 4 + 2 * i))
+        objects.append(_stream(content))
+    if image:
+        pixels = bytes([90, 120, 200] * 16)
+        objects.append(b"<< /Type /XObject /Subtype /Image /Width 4 /Height 4 /ColorSpace /DeviceRGB "
+                       b"/BitsPerComponent 8 /Length %d >>\nstream\n" % len(pixels) + pixels + b"\nendstream")
+    return _raw_pdf(out, objects)
+
+
+PAPER = b"1 1 1 rg 0 0 %.2f %.2f re f\n" % (LOGO_W, LOGO_H)
+# three letter blocks of one path that overlap their neighbours by 8 pt (nonzero, like the
+# «PRECISION» word of the 19.11 logo), an «O» with a hole drawn the other way, and a swoosh
+LETTERS = [(60.0, 200.0), (112.0, 200.0), (164.0, 200.0)]  # lower-left corners, 60 x 90 pt each
+LETTER_W, LETTER_H = 60.0, 90.0
+O_BOX = (260.0, 200.0, 80.0, 90.0)
+SWOOSH_BOX = (60.0, 80.0, 420.0, 60.0)
+
+
+def logo_ops() -> bytes:
+    ops = [_rg(DARK_BLUE)]
+    for x, y in LETTERS:
+        ops.append(_ops(_rounded_rect(x, y, LETTER_W, LETTER_H, 12)))
+    x, y, w, h = O_BOX
+    ops.append(_ops(_rounded_rect(x, y, w, h, 30)))
+    ops.append(_ops(_reverse(_rounded_rect(x + 22, y + 22, w - 44, h - 44, 12))))
+    ops.append(b"f\n")
+    ops.append(_rg(LIGHT_BLUE))
+    x, y, w, h = SWOOSH_BOX
+    ops.append(_ops(_rounded_rect(x, y, w, h, 28)))
+    ops.append(b"f\n")
+    return b"".join(ops)
+
+
+def build_logo_pdf(out: Path, *, paper: bool = True) -> Path:
+    """The 19.11 case without the customer's file: fills only (two blues), on white paper."""
+    return _content_pdf(out, [(PAPER if paper else b"") + logo_ops()])
+
+
+def build_logo_variant_pdf(out: Path, variant: str) -> Path:
+    """Probe inputs: ``"stroke"`` — one shape also stroked; ``"image"`` — plus a small image;
+    ``"text"`` — plus the real text «Made in USA»; ``"six_pages"`` — the logo on 6 pages."""
+    if variant == "stroke":
+        return _content_pdf(out, [PAPER + logo_ops() + b"0 0 0 RG 1 w 400 200 m 500 290 l S\n"])
+    if variant == "image":
+        return _content_pdf(out, [PAPER + logo_ops() + b"q 40 0 0 40 500 300 cm /Im1 Do Q\n"], image=True)
+    if variant == "text":
+        text = b"0 0 0 rg BT /F1 14 Tf 60 40 Td (Made in USA) Tj ET\n"
+        return _content_pdf(out, [PAPER + logo_ops() + text], fonts=True)
+    if variant == "six_pages":
+        return _content_pdf(out, [PAPER + logo_ops()] * 6)
+    raise ValueError(variant)
+
+
+PLATE_CENTER, PLATE_R = (306.0, 198.0), 150.0
+PLATE_LETTERS = [(186.0 + i * 64.0, 168.0) for i in range(4)]  # «ACME»: 4 white blocks 48 x 60 pt
+
+
+def build_plate_pdf(out: Path) -> Path:
+    """A blue disc with white letters (curves) on top of it."""
+    ops = [PAPER, _rg((0.0, 0.0, 1.0)), _ops(_circle(*PLATE_CENTER, PLATE_R)), b"f\n", _rg((1, 1, 1))]
+    for x, y in PLATE_LETTERS:
+        ops.append(_ops(_rounded_rect(x, y, 48, 60, 8)))
+    ops.append(b"f\n")
+    return _content_pdf(out, [b"".join(ops)])
+
+
+def build_white_logo_pdf(out: Path) -> Path:
+    """A logo drawn in white without any background or paper fill."""
+    ops = [_rg((1, 1, 1)), _ops(_rounded_rect(100, 100, 150, 100, 20)), _ops(_circle(400, 150, 60)), b"f\n"]
+    return _content_pdf(out, [b"".join(ops)])
+
+
+def build_overlap_colors_pdf(out: Path) -> Path:
+    """A red square (100..300 pt) and, painted later, a blue disc over its right edge."""
+    ops = [PAPER, _rg((1, 0, 0)), b"100 100 200 200 re f\n",
+           _rg((0, 0, 1)), _ops(_circle(300, 200, 60)), b"f\n"]
+    return _content_pdf(out, [b"".join(ops)])
+
+
+STAR_CENTER, STAR_R = (306.0, 198.0), 150.0
+
+
+def star_points() -> list[tuple[float, float]]:
+    """The five points of a {5/2} star in drawing order (every second vertex)."""
+    import math
+
+    cx, cy = STAR_CENTER
+    pts = [(cx + STAR_R * math.cos(math.pi / 2 + i * 2 * math.pi / 5),
+            cy + STAR_R * math.sin(math.pi / 2 + i * 2 * math.pi / 5)) for i in range(5)]
+    return [pts[(2 * i) % 5] for i in range(5)]
+
+
+def build_star_pdf(out: Path, *, even_odd: bool = True) -> Path:
+    pts = star_points()
+    segs = [(pts[i], pts[(i + 1) % 5]) for i in range(5)]
+    return _content_pdf(out, [PAPER + _rg((0, 0.5, 0)) + _ops(segs) + (b"f*\n" if even_odd else b"f\n")])
+
+
+def build_dash_segments_pdf(out: Path) -> Path:
+    """A dashed line stroked as 10 separate segments of one path."""
+    ops = [b"0 0 0 RG 0.5 w\n"]
+    for i in range(10):
+        x = 60 + i * 30
+        ops.append(b"%.1f 200 m %.1f 200 l\n" % (x, x + 18))
+    ops.append(b"S\n")
+    return _content_pdf(out, [PAPER + b"".join(ops)])
+
+
+def build_paper_only_pdf(out: Path) -> Path:
+    return _content_pdf(out, [PAPER])
+
+
+def build_outline_pdf(out: Path) -> Path:
+    """--hatch-fills outlines (engine 1.7): a closed subpath of 40 Béziers and 6 lines, a
+    rectangle and a circle of 4 Béziers, each its own fill-only path."""
+    import math
+
+    segs: list[tuple] = []
+    cx, cy, r = 200.0, 200.0, 90.0
+    n = 40
+    angles = [math.pi * 2 * i / (n + 6) for i in range(n + 7)]
+    radius = [r * (1 + 0.1 * math.sin(5 * a)) for a in angles]
+    pts = [(cx + q * math.cos(a), cy + q * math.sin(a)) for q, a in zip(radius, angles, strict=True)]
+    for i in range(n + 6):
+        a, b = pts[i], pts[(i + 1) % (n + 6)]
+        if i < n:
+            c1 = (a[0] + (b[0] - a[0]) / 3 + 2, a[1] + (b[1] - a[1]) / 3 + 2)
+            c2 = (a[0] + 2 * (b[0] - a[0]) / 3 + 2, a[1] + 2 * (b[1] - a[1]) / 3 + 2)
+            segs.append((a, c1, c2, b))
+        else:
+            segs.append((a, b))
+    ops = [PAPER, _rg((0.8, 0.1, 0.1)), _ops(segs), b"f\n",
+           _rg((0.1, 0.6, 0.1)), b"380 120 120 80 re f\n",
+           _rg((0.1, 0.1, 0.8)), _ops(_circle(480, 300, 40)), b"f\n"]
+    return _content_pdf(out, [b"".join(ops)])
+
+
+def build_ocg_logo_pdf(out: Path) -> Path:
+    """A fill-only logo shape inside the optional-content layer LOGO."""
+    import pymupdf
+
+    doc = pymupdf.open()
+    logo = doc.add_ocg("LOGO")
+    page = doc.new_page(width=LOGO_W, height=LOGO_H)
+    shape = page.new_shape()
+    shape.draw_circle((200, 200), 60)
+    shape.draw_rect(pymupdf.Rect(240, 180, 400, 220))
+    shape.finish(fill=(0.05, 0.2, 0.55), color=None, oc=logo)
+    shape.commit()
+    doc.save(out)
     return out

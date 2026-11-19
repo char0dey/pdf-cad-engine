@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pdf-cad-engine"
-version = "1.6.0"
+version = "1.7.0"
 description = "PDF <-> DXF conversion engine (command-line tool) used by PDFConvert"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
@@ -18,6 +18,8 @@ dependencies = [
     "pymupdf==1.26.7",
     "Pillow==12.3.0",
     "numpy==2.5.4",
+    # fill regions (nonzero / even-odd) and the --cut contours (engine 1.7); BSD-3-Clause
+    "shapely==2.2.0",
 ]
 
 [project.optional-dependencies]

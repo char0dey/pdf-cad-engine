@@ -2,10 +2,11 @@
 # Copyright (C) 2026 Quazar Digital OÜ
 """Write a synthetic heavy PDF for calibrating the background threshold (engine 1.6).
 
-    python scripts/make_heavy_pdf.py OUT.pdf UNITS [--kind outlines|lines] [--pages N]
+    python scripts/make_heavy_pdf.py OUT.pdf UNITS [--kind outlines|fills|lines] [--pages N]
 
 UNITS is paths + segments in all, as ``probe-pdf`` reports them (``vector_paths`` +
 ``vector_segments``). ``outlines`` is text converted to curves (filled and stroked glyph outlines),
+``fills`` the same glyphs filled only (engine 1.7: the paths that become fill areas),
 ``lines`` a line drawing (one line per path). Development only: no customer data.
 """
 

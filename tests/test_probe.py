@@ -156,6 +156,7 @@ def test_probe_pdf_heavy_page_fits_the_budget(gen):
     assert run.meta["text_as_outlines"] is True
     assert run.meta["vector_paths"] == 150_000
     assert run.meta["vector_segments"] == 150_000 * 5
+    assert run.meta["suggested_purpose"] == "cad"  # engine 1.7: a page too heavy to read
 
 
 def test_probe_pdf_reports_the_cost_when_the_budget_runs_out_later(gen):
@@ -184,6 +185,7 @@ def test_probe_pdf_reports_the_cost_when_the_budget_runs_out_later(gen):
         probe_pdf(str(path), budget=SpentAfterCounting(1), meta=meta)
     assert (meta["vector_paths"], meta["vector_segments"]) == (30_000, 30_000)
     assert "has_vectors" not in meta
+    assert "suggested_purpose" not in meta  # engine 1.7: the service then takes «cad»
 
 
 def test_probe_pdf_reads_an_ordinary_plan(sample_plan_pdf, monkeypatch):
@@ -215,3 +217,44 @@ def test_probe_pdf_scan_cost(scan_pdf):
 def test_probe_dxf_has_no_pdf_cost(sample_plan_dxf):
     run = run_engine("probe-dxf", "--in", sample_plan_dxf)
     assert run.meta["vector_paths"] is None and run.meta["vector_segments"] is None
+
+
+# -- engine 1.7: the suggested purpose (cut for a PDF of fills only) --------------------------
+def _suggest(pdf) -> dict:
+    run = run_engine("probe-pdf", "--in", pdf)
+    assert run.returncode == 0, run.stderr
+    return run.meta
+
+
+def test_probe_suggests_cut_for_a_logo(logo_pdf):
+    meta = _suggest(logo_pdf)
+    assert meta["suggested_purpose"] == "cut"
+    assert meta["fill_paths"] == 2 and meta["stroke_paths"] == 0  # the paper does not count
+    assert meta["text_entities"] == 0 and meta["images"] == 0
+
+
+def test_probe_suggests_cad_for_a_plan(sample_plan_pdf, antrag_pdf, cad_like_pdf):
+    for pdf in (sample_plan_pdf, antrag_pdf, cad_like_pdf):
+        assert _suggest(pdf)["suggested_purpose"] == "cad", pdf.name
+
+
+def test_probe_suggests_cad_for_a_logo_with_a_stroke_an_image_or_text(logo_variant_pdf):
+    stroked = _suggest(logo_variant_pdf("stroke"))
+    assert stroked["suggested_purpose"] == "cad" and stroked["stroke_paths"] == 1
+    assert _suggest(logo_variant_pdf("image"))["suggested_purpose"] == "cad"
+    assert _suggest(logo_variant_pdf("text"))["suggested_purpose"] == "cad"
+
+
+def test_probe_suggests_cad_beyond_the_pages_read(logo_variant_pdf):
+    meta = _suggest(logo_variant_pdf("six_pages"))
+    assert meta["pages"] == 6 and meta["suggested_purpose"] == "cad"
+
+
+def test_probe_suggests_cad_for_a_scan_and_paper_only(scan_pdf, paper_only_pdf):
+    assert _suggest(scan_pdf)["suggested_purpose"] == "cad"
+    assert _suggest(paper_only_pdf)["suggested_purpose"] == "cad"
+
+
+def test_probe_suggests_cut_for_white_and_plate_logos(white_logo_pdf, plate_pdf):
+    assert _suggest(white_logo_pdf)["suggested_purpose"] == "cut"
+    assert _suggest(plate_pdf)["suggested_purpose"] == "cut"

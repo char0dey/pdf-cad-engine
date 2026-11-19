@@ -5,7 +5,7 @@
     python -I -m cad_engine <command> --in <file> [--out <file>] [--preview <png>]
                             [--meta <path>] [--budget-ms N] [--tmp <dir>]
                             [pdf2dxf: --arcs --hatch-fills --linetypes --merge --raster-fallback
-                                      --scale asis|1-50|1-100|1-200 --units mm|inch]
+                                      --scale asis|1-50|1-100|1-200 --units mm|inch --cut]
                             [dxf2pdf: --page auto|a4|a3|a2|a1 --colors color|mono --layouts]
                             [probe-dxf: --light]
     python -I -m cad_engine --version
@@ -41,7 +41,7 @@ from cad_engine.errors import (
 
 COMMANDS = ("pdf2dxf", "dxf2pdf", "probe-pdf", "probe-dxf", "preview-dxf")
 NEEDS_OUT = frozenset({"pdf2dxf", "dxf2pdf", "preview-dxf"})
-PDF2DXF_FLAGS = ("arcs", "hatch_fills", "linetypes", "merge", "raster_fallback", "scale", "units")
+PDF2DXF_FLAGS = ("arcs", "hatch_fills", "linetypes", "merge", "raster_fallback", "scale", "units", "cut")
 DXF2PDF_FLAGS = ("page", "colors", "layouts")
 PROBE_DXF_FLAGS = ("light",)
 DEFAULT_BUDGET_MS = 90_000
@@ -81,6 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
     pdf.add_argument("--scale", choices=("asis", "1-50", "1-100", "1-200"),
                      help="drawing scale (default asis)")
     pdf.add_argument("--units", choices=("mm", "inch"), help="DXF units (default mm)")
+    pdf.add_argument("--cut", action="store_true", default=None,
+                     help="closed contours for cutting (CNC, laser, plasma), DXF R2000; "
+                          "overrides --arcs --hatch-fills --linetypes --merge")
     dxf = parser.add_argument_group("dxf2pdf options")
     dxf.add_argument("--page", choices=("auto", "a4", "a3", "a2", "a1"), help="paper size (default auto)")
     dxf.add_argument("--colors", choices=("color", "mono"), help="colours (default color)")
@@ -109,6 +112,12 @@ def new_meta() -> dict:
         "recognized": None,
         "scale": None,
         "units": None,
+        "purpose": None,
+        "contours": None,
+        "cut_text_kept": None,
+        "fill_paths": None,
+        "stroke_paths": None,
+        "suggested_purpose": None,
         "empty": None,
         "dxf_version": None,
         "page_size_mm": None,
@@ -221,6 +230,7 @@ def _dispatch(args: argparse.Namespace, budget: Budget, meta: dict) -> None:
             raster_fallback=bool(args.raster_fallback),
             scale=args.scale or "asis",
             units=args.units or "mm",
+            cut=bool(args.cut),
         )
         convert(args.input, args.out, budget=budget, meta=meta, preview_path=args.preview, options=options)
     elif args.command == "dxf2pdf":

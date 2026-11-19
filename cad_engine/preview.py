@@ -8,7 +8,8 @@ vectors go into one raw PDF content stream of a scratch PyMuPDF page sized to th
 content extents, texts are added on top, and MuPDF rasterises the page once.
 White strokes are drawn black, as a CAD viewer on a white background would.
 Solid fills (pdf2dxf ``--hatch-fills``) are painted below the strokes; dashed linetypes
-(``--linetypes``) are drawn with the dash pattern the DXF linetype produces.
+(``--linetypes``) are drawn with the dash pattern the DXF linetype produces. With ``--cut``
+there are no fills: the preview shows the contours a cutting program will follow.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ PT2MM = 25.4 / 72.0
 LONGEST_SIDE_PX = 1400
 MARGIN_RATIO = 0.02
 MIN_STROKE_PX = 0.6
+CUT_MIN_STROKE_PX = 1.5  # pdf2dxf --cut: the contours are the whole result, they must read clearly
 MIN_TEXT_PX = 0.5
 SUBPATHS_PER_STROKE = 2000
 _FONT_RES = "CEHelv"
@@ -55,11 +57,12 @@ class PreviewRecorder:
     ``--units``); stroke widths in pt are converted with it.
     """
 
-    def __init__(self, unit_scale: float = 1.0) -> None:
+    def __init__(self, unit_scale: float = 1.0, min_stroke_px: float = MIN_STROKE_PX) -> None:
         self.unit_scale = unit_scale
+        self.min_stroke_px = min_stroke_px
         self.paths: dict[Style, list[tuple[list[tuple[float, float]], bool | None]]] = {}
         self.texts: list[tuple[tuple[float, float], str, float, float, tuple[int, int, int]]] = []
-        self.fills: list[tuple[tuple[int, int, int], list]] = []
+        self.fills: list[tuple[tuple[int, int, int], list, bool]] = []
 
     def polyline(self, style: Style, pts: list[tuple[float, float]], closed: bool) -> None:
         self.paths.setdefault(style, []).append((pts, closed))
@@ -67,10 +70,11 @@ class PreviewRecorder:
     def bezier(self, style: Style, cps: list[tuple[float, float]]) -> None:
         self.paths.setdefault(style, []).append((cps, None))
 
-    def fill(self, rgb: tuple[int, int, int], loops: list) -> None:
-        """Solid fill (a DXF HATCH: odd parity, true colour, white stays white); loops are
-        lists of ('l', a, b) / ('c', p0, p1, p2, p3) segments."""
-        self.fills.append((rgb, loops))
+    def fill(self, rgb: tuple[int, int, int], loops: list, even_odd: bool = True) -> None:
+        """Solid fill (true colour, white stays white); loops are lists of ('l', a, b) /
+        ('c', p0, p1, p2, p3) segments, painted by the PDF rule: even-odd (odd parity, as a DXF
+        HATCH) or nonzero — the original subpaths of a fill thus show its painted area (1.7)."""
+        self.fills.append((rgb, loops, even_odd))
 
     def text(self, insert: tuple[float, float], text: str, size: float, rotation: float,
              rgb: tuple[int, int, int]) -> None:
@@ -99,7 +103,9 @@ class PreviewRecorder:
         stream = self._fill_stream(ox, oy, scale) + self._vector_stream(ox, oy, scale) + text_stream
         xref = doc.get_new_xref()
         doc.update_object(xref, "<<>>")
-        doc.update_stream(xref, stream.encode("ascii"))
+        # rasterised in memory only, never saved: deflating a stream of millions of operators took
+        # seconds for nothing (1.7)
+        doc.update_stream(xref, stream.encode("ascii"), compress=0)
         doc.xref_set_key(page.xref, "Contents", f"{xref} 0 R")
         doc.xref_set_key(page.xref, "Resources", _RESOURCES)
         page = doc.reload_page(page)
@@ -112,7 +118,7 @@ class PreviewRecorder:
         if not self.fills:
             return ""
         out = ["q\n"]
-        for rgb, loops in self.fills:
+        for rgb, loops, even_odd in self.fills:
             r, g, b = (v / 255.0 for v in rgb)
             out.append(f"{r:.3f} {g:.3f} {b:.3f} rg\n")
             for loop in loops:
@@ -127,7 +133,7 @@ class PreviewRecorder:
                         seg.append(coords + " c")
                 seg.append("h\n")
                 out.append(" ".join(seg))
-            out.append("f*\n")
+            out.append("f*\n" if even_odd else "f\n")
         out.append("Q\n")
         return "".join(out)
 
@@ -135,7 +141,7 @@ class PreviewRecorder:
         out = ["q 1 J 1 j\n"]
         for (rgb, width_pt, dash), items in self.paths.items():
             r, g, b = display_rgb(rgb)
-            lw = max(width_pt * PT2MM * self.unit_scale * s, MIN_STROKE_PX)
+            lw = max(width_pt * PT2MM * self.unit_scale * s, self.min_stroke_px)
             pattern = f"[{dash[0] * s:.3f} {max(dash[1] * s, 0.01):.3f}] 0 d" if dash else "[] 0 d"
             out.append(f"{r:.3f} {g:.3f} {b:.3f} RG {lw:.3f} w {pattern}\n")
             pending = 0

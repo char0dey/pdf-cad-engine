@@ -356,3 +356,84 @@ def ceco_dxf() -> Path:
 @pytest.fixture(scope="session")
 def floorplan_pdf(gen, floorplan_dxf) -> Path:
     return dxf_to_pdf_in_process(floorplan_dxf, gen / "floorplan.pdf")
+
+
+# -- engine 1.7: fill regions and --cut (synthetic logos, `make_sample`) ----------------------
+@pytest.fixture(scope="session")
+def logo_pdf(gen) -> Path:
+    return make_sample.build_logo_pdf(gen / "logo.pdf")
+
+
+@pytest.fixture(scope="session")
+def logo_variant_pdf(gen):
+    """``logo_variant_pdf(variant)`` → `make_sample.build_logo_variant_pdf` (built once per variant)."""
+    built: dict[str, Path] = {}
+
+    def get(variant: str) -> Path:
+        if variant not in built:
+            built[variant] = make_sample.build_logo_variant_pdf(gen / f"logo_{variant}.pdf", variant)
+        return built[variant]
+
+    return get
+
+
+@pytest.fixture(scope="session")
+def plate_pdf(gen) -> Path:
+    return make_sample.build_plate_pdf(gen / "plate.pdf")
+
+
+@pytest.fixture(scope="session")
+def white_logo_pdf(gen) -> Path:
+    return make_sample.build_white_logo_pdf(gen / "white_logo.pdf")
+
+
+@pytest.fixture(scope="session")
+def overlap_colors_pdf(gen) -> Path:
+    return make_sample.build_overlap_colors_pdf(gen / "overlap_colors.pdf")
+
+
+@pytest.fixture(scope="session")
+def star_pdf(gen) -> Path:
+    return make_sample.build_star_pdf(gen / "star.pdf")
+
+
+@pytest.fixture(scope="session")
+def dash_segments_pdf(gen) -> Path:
+    return make_sample.build_dash_segments_pdf(gen / "dash_segments.pdf")
+
+
+@pytest.fixture(scope="session")
+def paper_only_pdf(gen) -> Path:
+    return make_sample.build_paper_only_pdf(gen / "paper_only.pdf")
+
+
+@pytest.fixture(scope="session")
+def outline_pdf(gen) -> Path:
+    return make_sample.build_outline_pdf(gen / "outline.pdf")
+
+
+@pytest.fixture(scope="session")
+def ocg_logo_pdf(gen) -> Path:
+    return make_sample.build_ocg_logo_pdf(gen / "ocg_logo.pdf")
+
+
+def preview_pixel(png: Path, bounds: tuple[float, float, float, float], x: float, y: float, radius: int = 0):
+    """RGB of the pdf2dxf preview at drawing point (x, y) — with `radius`, the darkest pixel of
+    the square around it; `bounds` = drawing extents (the DXF $EXTMIN / $EXTMAX), mapped the
+    way `PreviewRecorder.render_png` does."""
+    import numpy as np
+    import pymupdf
+
+    from cad_engine.preview import LONGEST_SIDE_PX, MARGIN_RATIO
+
+    min_x, min_y, max_x, max_y = bounds
+    w, h = max_x - min_x, max_y - min_y
+    margin = max(w, h) * MARGIN_RATIO
+    scale = LONGEST_SIDE_PX / (max(w, h) + 2 * margin)
+    pix = pymupdf.Pixmap(str(png))
+    data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
+    col = int((x - (min_x - margin)) * scale)
+    row = pix.height - 1 - int((y - (min_y - margin)) * scale)
+    area = data[max(0, row - radius):row + radius + 1, max(0, col - radius):col + radius + 1, :3]
+    flat = area.reshape(-1, 3)
+    return tuple(int(v) for v in flat[flat.sum(axis=1).argmin()])
